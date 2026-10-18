@@ -9,16 +9,24 @@ the whole project under it, and what each turn touched marked on it.
 
 ## What it shows
 
-- **The project tree**, IDE style: a changed file's name in blue, a new one in
+- **The project tree**, IDE style: each file with its type's badge where an
+  IDE draws its icon (`TS`, `MD`, `{}` on a tint of the language's colour,
+  left out when the pane is narrow), a changed file's name in blue, a new one in
   green, one git doesn't track in orange, a deleted one struck through, a
-  refused edit in red, with the status letter at the right edge
-  (`M A U D R !`) and a dot on every folder holding a change.
+  refused edit in red with a `!`; its lines added and removed at the right edge
+  (`+12 −3`), a word where the colour means more than a change (*new*,
+  *renamed*, *untracked*), and a dot on every folder holding a change. It folds
+  like the sections above it.
 - **Each turn's footprint**: the files Claude edited or created, the ones it
   only read, and the ones its shell commands wrote (`sed`, `npm install`,
-  code generators) — which file-tool-only views miss.
+  code generators) — which file-tool-only views miss. A line above the lists
+  sums it up: how many files, how many lines, how many commands.
 - **Other changes**, in their own folded section: files that changed during the
   turn outside Claude's edits and commands (you in your IDE, a formatter run by
   a hook, a watcher left running).
+- **Outside the project**, folded too: what Claude wrote beyond the project's
+  folder (a scratch file, a setting in your home folder), worth a look but
+  kept out of the project's summary.
 - **The diff of a turn**, not just against the last commit: the whole file with
   its changes coloured, or only the changes, block by block. The last ten turns
   stay one click away.
@@ -67,7 +75,8 @@ In the desktop app, where `/plugin` does not run: click + next to the prompt
 box, then Plugins, Add marketplace with `MassimilianoRocco/canopy`, then Add
 plugin.
 
-Then open the pane with `/canopy`. Turn it off and on from the app's plugin
+The pane opens by itself as a session starts; closed, `/canopy` brings it
+back. Turn it off and on from the app's plugin
 list, or with `claude plugin disable canopy` / `claude plugin enable canopy`.
 
 To update to a newer version:
@@ -95,9 +104,12 @@ Any JetBrains IDE works through its launcher (`webstorm64.exe`, `pycharm`…).
 ## Limits
 
 - One git repository: the project folder or a folder inside one.
-- Files over 1 MB are listed but not diffed.
+- Files over 1 MB are listed but not diffed. A diff too long for one drawing
+  (some 90,000 characters) shows only its changes, as many as fit.
 - A file changed by a command is attributed by time: written while one of
-  Claude's commands ran is Claude's, anything else is an *other change*.
+  Claude's commands ran is Claude's, anything else is an *other change*. A
+  command left running in the background counts as running until its turn
+  ends: what it writes in a later turn is an *other change*.
 
 ## License
 

@@ -19,6 +19,9 @@ export type TouchedFile = {
    * person, an editor, a hook, a process left running).
    */
   via?: 'shell' | 'outside'
+  /** Lines added and removed since the turn began, once counted: absent until then. */
+  added?: number
+  removed?: number
 }
 
 /** One turn of the main conversation: the prompt and the files it touched. */
@@ -65,8 +68,16 @@ export type Lang = 'en' | 'it'
 /**
  * One path `git status` lists: modified (`M`), added (`A`), deleted (`D`),
  * renamed or copied (`R`), unknown to git (`?`), or in conflict (`U`).
+ * `from` is a rename's or copy's source, where its last commit's text is.
  */
-export type GitFile = { rel: string; code: 'M' | 'A' | 'D' | 'R' | '?' | 'U' }
+export type GitFile = {
+  rel: string
+  code: 'M' | 'A' | 'D' | 'R' | '?' | 'U'
+  from?: string
+  /** Lines added and removed since the last commit; absent for a file git doesn't track, or a binary one. */
+  added?: number
+  removed?: number
+}
 
 /** The last `git status`, its paths relative to `top`, the repository's root. */
 export type GitStatus = { at: number; top: string; files: GitFile[] }

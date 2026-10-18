@@ -120,6 +120,75 @@ async function findVscode($: EngineInterface, isWindows: boolean) {
   )
 }
 
+// ---- A launcher script and the program it starts ----
+// `code.cmd` and the JetBrains Toolbox scripts only start a program
+// (`"%~dp0..\Code.exe" … %*`, `start "" "C:\…\idea64.exe" %*`), and the
+// `code` command itself ends by starting Code.exe with the same arguments. A
+// script runs through cmd.exe, which reads `%NAME%` (and, where the registry
+// turns it on, `!NAME!`) in a file's name as a variable: so Canopy starts the
+// program itself, and no shell ever reads a name
+
+const isScript = (path: string) => /\.(?:cmd|bat)$/i.test(path)
+
+// A Windows path with `.` and `..` folded away: `C:\VS Code\bin\..\Code.exe` → `C:\VS Code\Code.exe`
+const folded = (path: string) => {
+  const parts: string[] = []
+  for (const part of path.split(/[\\/]/)) {
+    if (part === '..') {
+      if (parts.length > 1) parts.pop()
+    } else if (part !== '.') parts.push(part)
+  }
+
+  return parts.join('\\')
+}
+
+// The folders a launcher script may name its program by, lowercase as
+// Windows reads a variable's name whatever its case
+async function folderVariables($: EngineInterface): Promise<Record<string, string | undefined>> {
+  return {
+    localappdata: await $.env.get('LOCALAPPDATA'),
+    appdata: await $.env.get('APPDATA'),
+    programfiles: await $.env.get('ProgramFiles'),
+    'programfiles(x86)': await $.env.get('ProgramFiles(x86)'),
+    userprofile: await $.env.get('USERPROFILE'),
+  }
+}
+
+/**
+ * The program a launcher script starts: the first quoted `.exe` in it,
+ * absolute or beside the script (`%~dp0`), or under one of the usual folders
+ * (`%LOCALAPPDATA%`). Undefined when the script can't be read, names none, or
+ * names it otherwise, or the program isn't there.
+ */
+async function programOf($: EngineInterface, script: string): Promise<string | undefined> {
+  const text = await $.fs.read(script).catch(() => undefined)
+  if (text === undefined || text.length > 64_000) return undefined
+  const dir = script.slice(0, Math.max(script.lastIndexOf('\\'), script.lastIndexOf('/')) + 1)
+  let folders: Record<string, string | undefined> | undefined
+  for (const [, quoted] of text.matchAll(/"([^"\r\n]+?\.exe)"/gi)) {
+    let path = quoted!.replace(/%~dp0/gi, () => dir)
+    if (/%[^%]+%/.test(path)) {
+      folders ??= await folderVariables($)
+      const known = folders
+      path = path.replace(/%([^%]+)%/g, (variable, name: string) => known[name.toLowerCase()] ?? variable)
+    }
+    // A variable left unread, or a path not whole: not one to start
+    if (path.includes('%') || !/^[A-Za-z]:[\\/]/.test(path)) continue
+    const program = folded(path)
+    if (await isThere($, program)) return program
+  }
+
+  return undefined
+}
+
+// The editor as found, started through its program where its launcher is a script
+async function direct($: EngineInterface, editor: Editor): Promise<Editor> {
+  if (!editor.isWindows || !isScript(editor.exe)) return editor
+  const program = await programOf($, editor.exe)
+
+  return program === undefined ? editor : { ...editor, exe: program }
+}
+
 // The one found as the session started
 let current: Editor | undefined
 
@@ -133,29 +202,52 @@ export const setEditor = (found: Editor | undefined) => {
 export async function findEditor($: EngineInterface, choice: EditorChoice, path: string): Promise<Editor | undefined> {
   if (choice === 'off') return undefined
   const isWindows = (await $.env.get('OS')) === 'Windows_NT'
-  if (path.trim() !== '') return editorOf(path.trim(), isWindows)
+  // Which editor it is, the launcher's name says; how it starts, `direct`
+  if (path.trim() !== '') return direct($, editorOf(path.trim(), isWindows))
 
   const intellij = choice === 'vscode' ? undefined : await findIntellij($, isWindows)
-  if (intellij !== undefined) return editorOf(intellij, isWindows)
+  if (intellij !== undefined) return direct($, editorOf(intellij, isWindows))
   const vscode = choice === 'intellij' ? undefined : await findVscode($, isWindows)
 
-  return vscode === undefined ? undefined : editorOf(vscode, isWindows)
+  return vscode === undefined ? undefined : direct($, editorOf(vscode, isWindows))
 }
+
+/** How a start went: `refused` when a script launcher would misread a name Canopy passes it. */
+export type Launch = 'started' | 'failed' | 'refused'
+
+/**
+ * A Windows argument as the program's own parser reads it back: quoted
+ * whole, a backslash run doubled where a quote or the end follows it.
+ */
+export const quoteArg = (arg: string) => `"${arg.replace(/(\\*)"/g, '$1$1\\"').replace(/(\\+)$/, '$1$1')}"`
+
+// Windows starts the launcher through Start-Process, which the launcher and
+// its arguments reach as variables: no shell reads a path, so an `&`, `^` or
+// `%` in a file's name is a character of it, never a command. A script
+// launcher whose program couldn't be found (see `direct`) runs in a hidden
+// console of its own
+const START = 'Start-Process -FilePath $env:CANOPY_EXE -ArgumentList $env:CANOPY_ARGS -ErrorAction Stop'
 
 // Started detached: a launcher that becomes the IDE itself (none was running)
 // must not hold the call, and Canopy never waits on the editor
-async function launch($: EngineInterface, editor: Editor, args: string[]) {
-  const argv = editor.isWindows
-    ? /\.(?:cmd|bat)$/i.test(editor.exe)
-      ? ['cmd', '/c', 'call', editor.exe, ...args]
-      : ['cmd', '/c', 'start', '', editor.exe, ...args]
-    : ['sh', '-c', '"$0" "$@" >/dev/null 2>&1 &', editor.exe, ...args]
-  const out = await $.process.run(argv, { timeoutMs: 15_000 }).catch(() => undefined)
+async function launch($: EngineInterface, editor: Editor, args: string[]): Promise<Launch> {
+  // A quote or a line break is in no Windows path: an argument holding one is refused, not passed
+  if (editor.isWindows && args.some(arg => /["\r\n]/.test(arg))) return 'failed'
+  const viaScript = editor.isWindows && isScript(editor.exe)
+  // Through a script, cmd.exe would read `%…%` or `!…!` in a name as a variable: another file would open
+  if (viaScript && args.some(arg => /[%!]/.test(arg))) return 'refused'
+  const run = editor.isWindows
+    ? $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', viaScript ? `${START} -WindowStyle Hidden` : START], {
+        env: { CANOPY_EXE: editor.exe, CANOPY_ARGS: args.map(quoteArg).join(' ') },
+        timeoutMs: 15_000,
+      })
+    : $.process.run(['sh', '-c', '"$0" "$@" >/dev/null 2>&1 &', editor.exe, ...args], { timeoutMs: 15_000 })
+  const out = await run.catch(() => undefined)
 
-  return out?.exitCode === 0
+  return out?.exitCode === 0 ? 'started' : 'failed'
 }
 
-/** Opens `path` at `line` in the editor; false when it could not be started. */
+/** Opens `path` at `line` in the editor. */
 export function openIn($: EngineInterface, editor: Editor, path: string, line: number) {
   return launch($, editor, editor.kind === 'vscode' ? ['--goto', `${path}:${line}`] : ['--line', String(line), path])
 }

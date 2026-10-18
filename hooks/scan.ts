@@ -2,12 +2,14 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, Timer } from 'claude-code'
 
 import type { FileText, GitFile, GitStatus, Snapshot, TouchedFile, TurnRecord } from '../types'
-import { clearHeads, headText, readCatalog, readGit, textOf } from './git'
+import { changesOf, diffLines, linesOf } from './diff'
+import { clearHeads, headText, readCatalog, readGit, rootOf, textOf } from './git'
 import { hasDiff, isClaude, withFile } from './model'
 import { keyOf, labelOf } from './paths'
 
 const history = atom({ plugin: 'canopy', key: 'history' } as const, [])
 const git = atom({ plugin: 'canopy', key: 'git' } as const, null)
+const mode = atom({ plugin: 'canopy', key: 'mode' } as const, 'turn')
 const root = atom({ plugin: 'canopy', key: 'root' } as const, '')
 const catalog = atom({ plugin: 'canopy', key: 'catalog' } as const, null)
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
@@ -18,11 +20,6 @@ const SCAN_DELAY = 400
 // A file written this close to one of Claude's commands is that command's
 const RUN_LEAD = 250
 const RUN_TAIL = 2000
-
-// The project's folder, the tree's root: a shell `cd` moves the cwd, never this
-export function rootOf($: EngineInterface) {
-  return $.session.root().catch(() => $.session.cwd()).catch(() => '')
-}
 
 async function baseOf($: EngineInterface) {
   return (await read($, root)) || (await rootOf($))
@@ -46,7 +43,8 @@ const MAX_START_TOTAL = 2_000_000
 const starts = new Map<string, Start | 'pending'>()
 
 async function readStart($: EngineInterface): Promise<Start> {
-  const status = await readGit($)
+  // It replaces the status the commit view draws: with its counts there
+  const status = await readGit($, (await read($, mode)) === 'commit')
   await update($, git, () => status)
   if (status === null) return null
 
@@ -89,18 +87,20 @@ async function startOf(
 ): Promise<{ before: FileText; base: 'turn' | 'head'; isNew: boolean } | undefined> {
   const start = starts.get(turnId)
   const isUnknownToGit = file.code === '?' || file.code === 'A'
+  // A rename's last commit is under its old path
+  const committed = file.from ?? file.rel
   if (start === undefined || start === 'pending' || start === null) {
-    return isUnknownToGit ? undefined : { before: await headText($, file.rel), base: 'head', isNew: false }
+    return isUnknownToGit ? undefined : { before: await headText($, committed), base: 'head', isNew: false }
   }
   const kept = start.texts.get(file.rel)
   if (kept !== undefined) return { before: kept, base: 'turn', isNew: false }
   if (start.dirty.has(file.rel)) {
-    return isUnknownToGit ? undefined : { before: await headText($, file.rel), base: 'head', isNew: false }
+    return isUnknownToGit ? undefined : { before: await headText($, committed), base: 'head', isNew: false }
   }
   // Clean as the turn began: a tracked file was its commit; any other didn't exist
   return isUnknownToGit
     ? { before: { kind: 'missing' }, base: 'turn', isNew: true }
-    : { before: await headText($, file.rel), base: 'turn', isNew: false }
+    : { before: await headText($, committed), base: 'turn', isNew: false }
 }
 
 // Written while one of the turn's commands ran (one still running counts to now)
@@ -164,13 +164,85 @@ async function markScanned($: EngineInterface, status: GitStatus) {
   }
 
   const ended = (await read($, history)).find(one => one.id === turn.id)
-  if (ended === undefined || ended.durationMs === null) return
-  for (const file of ended.files.filter(one => one.via !== undefined && hasDiff(one))) {
-    const snapshot = atom({ ...SNAPSHOT, id: `${ended.id}|${file.key}` }, {})
-    if ((await read($, snapshot)).after === undefined) {
-      const after = await textOf($, file.path)
-      await update($, snapshot, current => ({ ...current, after }))
+  if (ended === undefined) return
+  const changed = ended.files.filter(one => one.via !== undefined && hasDiff(one))
+  if (ended.durationMs !== null) {
+    for (const file of changed) {
+      const snapshot = atom({ ...SNAPSHOT, id: `${ended.id}|${file.key}` }, {})
+      if ((await read($, snapshot)).after === undefined) {
+        const after = await textOf($, file.path)
+        await update($, snapshot, current => ({ ...current, after }))
+      }
     }
+  }
+  // A command may have written a file again since it was first seen: counted afresh if so
+  for (const file of changed) countLater($, ended.id, file.key, false)
+}
+
+// ---- Each changed file's lines added and removed ----
+// Counted from the texts its diff is drawn from, a moment after the change and
+// off every path; one count at a time, so an older one never lands last
+
+const COUNT_DELAY = 300
+// By turn, the files to count, and whether each must be read again whatever its time says
+const due = new Map<string, Map<string, boolean>>()
+let countTimer: Timer | undefined
+let counting: Promise<void> = Promise.resolve()
+// What each count was taken from (`<turn>|<file>` → the file's time and size,
+// or the turn's end): a scan asks again for every file a command changed, and
+// one nothing touched since isn't read and diffed again
+const countedFrom = new Map<string, string>()
+const MAX_COUNTED = 2000
+
+const textOr = (text: FileText) => (text.kind === 'text' ? text.text : '')
+
+/**
+ * Counts the lines `key` added and removed in turn `turnId`, soon. A scan
+ * asks with `isForced` false: a file whose time and size are those of its
+ * last count is left as counted.
+ */
+export function countLater($: EngineInterface, turnId: string, key: string, isForced = true) {
+  const keys = due.get(turnId) ?? new Map<string, boolean>()
+  keys.set(key, isForced || keys.get(key) === true)
+  due.set(turnId, keys)
+  if (countTimer !== undefined) return
+  countTimer = $.clock.after(COUNT_DELAY, () => {
+    countTimer = undefined
+    counting = counting.then(() => countDue($)).catch(() => undefined)
+  })
+}
+
+async function countDue($: EngineInterface) {
+  const batch = [...due]
+  due.clear()
+  for (const [turnId, keys] of batch) {
+    const turn = (await read($, history)).find(one => one.id === turnId)
+    if (turn === undefined) continue
+    const counted = new Map<string, { added: number; removed: number }>()
+    for (const file of turn.files.filter(one => keys.has(one.key) && hasDiff(one))) {
+      const id = `${turnId}|${file.key}`
+      const snapshot = await read($, atom({ ...SNAPSHOT, id }, {}))
+      const before = snapshot.before
+      // As the file view draws it: the text the turn left, else the file now
+      const isLeft = snapshot.after !== undefined && turn.durationMs !== null
+      const stat = isLeft ? undefined : await $.fs.stat(file.path).catch(() => undefined)
+      const from = `${before === undefined ? '' : before.kind}|${isLeft ? 'left' : `${stat?.mtimeMs ?? -1}:${stat?.size ?? -1}`}`
+      if (keys.get(file.key) === false && file.added !== undefined && countedFrom.get(id) === from) continue
+      const after = isLeft ? snapshot.after! : await textOf($, file.path)
+      if (before === undefined || before.kind === 'too-large' || after.kind === 'too-large') continue
+      const { added, removed } = changesOf(diffLines(linesOf(textOr(before)), linesOf(textOr(after))))
+      counted.set(file.key, { added, removed })
+      if (countedFrom.size >= MAX_COUNTED) countedFrom.clear()
+      countedFrom.set(id, from)
+    }
+    if (counted.size === 0) continue
+    await update($, history, list =>
+      list.map(one =>
+        one.id !== turnId
+          ? one
+          : { ...one, files: one.files.map(file => ({ ...file, ...counted.get(file.key) })) },
+      ),
+    )
   }
 }
 
@@ -204,12 +276,23 @@ export function refreshCatalog($: EngineInterface, status: GitStatus | null) {
 
 let scanTimer: Timer | undefined
 let scanJob: Promise<void> | undefined
+// Whether git answered once since the module loaded: outside a repository the
+// status stays null, and a drawing that asked again on every null would loop
+let hasAnswered = false
 
 export const isScanning = () => scanTimer !== undefined || scanJob !== undefined
 
-export async function runScan($: EngineInterface) {
+export const hasScanned = () => hasAnswered
+
+/**
+ * Asks git again and marks what it found. The counts since the last commit
+ * only where they are drawn, and never on the prompt's path (`withCounts`
+ * false): one git call fewer.
+ */
+export async function runScan($: EngineInterface, withCounts?: boolean) {
   clearHeads()
-  const status = await readGit($)
+  const status = await readGit($, withCounts ?? (await read($, mode)) === 'commit')
+  hasAnswered = true
   await update($, git, () => status)
   if (status !== null) await markScanned($, status)
   refreshCatalog($, status)
@@ -231,7 +314,8 @@ export async function settleScan($: EngineInterface) {
   if (scanTimer !== undefined) {
     scanTimer.cancel()
     scanTimer = undefined
-    await runScan($).catch(() => undefined)
+    // The turn's attribution needs the status alone; the counts follow off the path
+    await runScan($, false).catch(() => undefined)
   }
   await scanJob
 }
@@ -239,4 +323,7 @@ export async function settleScan($: EngineInterface) {
 export const stopScans = () => {
   scanTimer?.cancel()
   scanTimer = undefined
+  countTimer?.cancel()
+  countTimer = undefined
+  due.clear()
 }

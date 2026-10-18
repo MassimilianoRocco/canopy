@@ -12,28 +12,24 @@ const en = {
   running: 'running…',
   interrupted: (took: string) => `interrupted after ${took}`,
   failedIn: (took: string) => `ended with an error in ${took}`,
-  finishedIn: (took: string) => `finished in ${took}`,
+  // A turn that ended well: its time says it
+  finishedIn: (took: string) => took,
 
   // Controls
   modeTurn: 'Turn',
-  modeCommit: 'Since last commit',
+  modeCommit: 'Commit',
   refresh: 'Refresh',
   collapse: 'Collapse',
   search: 'Search files…',
-  searchOpen: 'open',
+  // What Enter does in the search: the first of the results opens
+  searchOpen: 'Open first match',
 
-  // Counts: a letter's words, one and many
-  words: {
-    M: ['modified', 'modified'],
-    A: ['new', 'new'],
-    U: ['untracked', 'untracked'],
-    D: ['deleted', 'deleted'],
-    R: ['renamed', 'renamed'],
-    '!': ['failed', 'failed'],
-  } as Record<string, [string, string]>,
+  // The summary above the lists
+  files: (n: number) => count(n, 'file', 'files'),
   reads: (n: number) => count(n, 'read', 'read'),
-  commands: (n: number) => count(n, 'shell command', 'shell commands'),
+  commands: (n: number) => count(n, 'command', 'commands'),
   others: (n: number) => count(n, 'other change', 'other changes'),
+  elsewhere: (n: number) => `${n} outside the project`,
   sinceCommit: 'since the last commit',
 
   // Notices
@@ -43,8 +39,10 @@ const en = {
   nothingTouched: 'No files touched in this turn.',
 
   // Sections and lists
-  changes: 'CHANGES',
-  otherChanges: 'OTHER CHANGES',
+  changes: 'Changes',
+  otherChanges: 'Other changes',
+  outsideProject: 'Outside the project',
+  project: 'Project',
   more: (n: number) => `… ${n} more`,
   cut: '… list cut short: close a few folders',
   indexing: 'Indexing the project…',
@@ -66,12 +64,13 @@ const en = {
   failed: 'failed',
   outside: 'changed during the turn, outside Claude’s edits and commands',
   outsideShort: 'changed during the turn',
-  notes: {
-    R: 'renamed',
-    '?': 'untracked',
-    D: 'deleted',
-    U: 'conflict',
-  } as Record<string, string>,
+  // What a change's colour says, in a word
+  stateNew: 'new',
+  stateUntracked: 'untracked',
+  stateDeleted: 'deleted',
+  stateRenamed: 'renamed',
+  stateFailed: 'failed',
+  stateConflict: 'conflict',
 
   // The file view
   back: '◀ Tree',
@@ -87,6 +86,8 @@ const en = {
   hunk: (from: number, to: number) => (from === to ? `Line ${from}` : `Lines ${from}–${to}`),
   wholeFile: 'Whole file',
   onlyChanges: 'Only changes',
+  wholeTooLarge: 'too large to draw whole: only its changes',
+  restNotDrawn: '… the rest of the changes is not drawn here',
   noCompare: 'no comparison available',
   unchangedHead: 'unchanged since the last commit',
   unchangedTurn: 'not changed in this turn',
@@ -94,6 +95,8 @@ const en = {
   compare: (editor: string) => `Compare in ${editor}`,
   openHere: '↗',
   editorFailed: (editor: string) => `Could not start ${editor}. Set its launcher in Canopy’s options.`,
+  editorRefused: (editor: string) =>
+    `${editor} starts through a script that would misread this file’s name. Set its .exe as the launcher in Canopy’s options.`,
   beforeTurn: (n: number) => `before turn ${n}`,
   afterTurn: (n: number) => `after turn ${n}`,
   lastCommit: 'last commit',
@@ -110,26 +113,20 @@ const it: Strings = {
   running: 'in corso…',
   interrupted: took => `interrotto dopo ${took}`,
   failedIn: took => `finito con errore in ${took}`,
-  finishedIn: took => `finito in ${took}`,
+  finishedIn: took => took,
 
   modeTurn: 'Turno',
-  modeCommit: 'Dall’ultimo commit',
+  modeCommit: 'Commit',
   refresh: 'Aggiorna',
   collapse: 'Comprimi',
   search: 'Cerca file…',
-  searchOpen: 'apri',
+  searchOpen: 'Apri il primo',
 
-  words: {
-    M: ['modificato', 'modificati'],
-    A: ['nuovo', 'nuovi'],
-    U: ['non in git', 'non in git'],
-    D: ['eliminato', 'eliminati'],
-    R: ['rinominato', 'rinominati'],
-    '!': ['non riuscito', 'non riusciti'],
-  },
+  files: n => count(n, 'file', 'file'),
   reads: n => count(n, 'letto', 'letti'),
-  commands: n => count(n, 'comando shell', 'comandi shell'),
+  commands: n => count(n, 'comando', 'comandi'),
   others: n => count(n, 'altra modifica', 'altre modifiche'),
+  elsewhere: n => `${n} fuori dal progetto`,
   sinceCommit: 'dall’ultimo commit',
 
   askingGit: 'Interrogo git…',
@@ -137,8 +134,10 @@ const it: Strings = {
   noChangesCommit: 'Nessuna modifica dall’ultimo commit.',
   nothingTouched: 'Nessun file toccato in questo turno.',
 
-  changes: 'MODIFICHE',
-  otherChanges: 'ALTRE MODIFICHE',
+  changes: 'Modifiche',
+  otherChanges: 'Altre modifiche',
+  outsideProject: 'Fuori dal progetto',
+  project: 'Progetto',
   more: n => `… altri ${n}`,
   cut: '… elenco troncato: chiudi qualche cartella',
   indexing: 'Indicizzo il progetto…',
@@ -159,12 +158,12 @@ const it: Strings = {
   failed: 'non riuscito',
   outside: 'cambiato durante il turno, fuori dalle modifiche e dai comandi di Claude',
   outsideShort: 'cambiato durante il turno',
-  notes: {
-    R: 'rinominato',
-    '?': 'non in git',
-    D: 'eliminato',
-    U: 'conflitto',
-  },
+  stateNew: 'nuovo',
+  stateUntracked: 'non in git',
+  stateDeleted: 'eliminato',
+  stateRenamed: 'rinominato',
+  stateFailed: 'non riuscito',
+  stateConflict: 'conflitto',
 
   back: '◀ Albero',
   emptyFile: 'File vuoto.',
@@ -179,6 +178,8 @@ const it: Strings = {
   hunk: (from, to) => (from === to ? `Riga ${from}` : `Righe ${from}–${to}`),
   wholeFile: 'File intero',
   onlyChanges: 'Solo modifiche',
+  wholeTooLarge: 'troppo grande per mostrarlo intero: solo le modifiche',
+  restNotDrawn: '… il resto delle modifiche non è mostrato qui',
   noCompare: 'confronto non disponibile',
   unchangedHead: 'invariato dall’ultimo commit',
   unchangedTurn: 'non modificato in questo turno',
@@ -186,6 +187,8 @@ const it: Strings = {
   compare: editor => `Confronta in ${editor}`,
   openHere: '↗',
   editorFailed: editor => `Non riesco ad avviare ${editor}. Indica il suo launcher nelle opzioni di Canopy.`,
+  editorRefused: editor =>
+    `${editor} si avvia tramite uno script che leggerebbe male il nome di questo file. Indica il suo .exe come launcher nelle opzioni di Canopy.`,
   beforeTurn: n => `prima del turno ${n}`,
   afterTurn: n => `dopo il turno ${n}`,
   lastCommit: 'ultimo commit',

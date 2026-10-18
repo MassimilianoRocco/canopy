@@ -23,6 +23,17 @@ export const withLast = (list: readonly TurnRecord[], change: (turn: TurnRecord)
   change(list.at(-1) ?? orphan()),
 ]
 
+/**
+ * Changes turn `id`: the one a call began in, though a new turn started while
+ * it ran (a subagent left running). The latest where it is no longer kept.
+ */
+export const withTurn = (
+  list: readonly TurnRecord[],
+  id: string,
+  change: (turn: TurnRecord) => TurnRecord,
+): TurnRecord[] =>
+  list.some(turn => turn.id === id) ? list.map(turn => (turn.id === id ? change(turn) : turn)) : withLast(list, change)
+
 export const withFile = (
   turn: TurnRecord,
   seed: Pick<TouchedFile, 'key' | 'path' | 'label'>,
@@ -58,6 +69,15 @@ export const isOutside = (file: TouchedFile) => file.via === 'outside' && !isCla
 export const hasDiff = (file: TouchedFile) => isClaude(file) || isOutside(file)
 
 export const isRead = (file: TouchedFile) => !hasDiff(file) && (file.reads > 0 || file.pending === 'read')
+
+/** Nothing happened to it, nothing is under way: a failed read leaves such a row behind. */
+export const isBlank = (file: TouchedFile) =>
+  file.reads === 0 &&
+  file.edits === 0 &&
+  file.failures === 0 &&
+  file.running === 0 &&
+  !file.isCreated &&
+  file.via === undefined
 
 /** Shows up in the Changes list: Claude's changes, and its refused edits. */
 export const isChange = (file: TouchedFile) => !isRead(file) && !isOutside(file)
@@ -139,26 +159,21 @@ export const TONE_OF_CODE: Record<GitFile['code'], Tone> = {
   U: 'failed',
 }
 
-const LETTER_OF_TONE: Partial<Record<Tone, string>> = {
-  changed: 'M',
-  created: 'A',
-  untracked: 'U',
-  deleted: 'D',
-  failed: '!',
+/** What a change's colour says, in a word, where it is more than a modification. */
+export const wordOf = (s: Strings, tone: Tone, code?: GitFile['code']): string | undefined => {
+  if (code === 'R') return s.stateRenamed
+  if (code === 'U') return s.stateConflict
+  if (tone === 'created') return s.stateNew
+  if (tone === 'untracked') return s.stateUntracked
+  if (tone === 'deleted') return s.stateDeleted
+  if (tone === 'failed') return s.stateFailed
+
+  return undefined
 }
 
-export const letterOf = (tone: Tone, code?: GitFile['code']) => (code === 'R' ? 'R' : LETTER_OF_TONE[tone])
-
-export const LETTERS = ['M', 'A', 'U', 'D', 'R', '!'] as const
-
-export const TONE_OF_LETTER: Record<string, Tone> = {
-  M: 'changed',
-  A: 'created',
-  U: 'untracked',
-  D: 'deleted',
-  R: 'changed',
-  '!': 'failed',
-}
+/** A file's lines added and removed, once counted. */
+export const countsOf = (file: { added?: number; removed?: number }): [number, number] | undefined =>
+  file.added === undefined || file.removed === undefined ? undefined : [file.added, file.removed]
 
 export const isDimTone = (tone: Tone) => tone === 'deleted' || tone === 'outside' || tone === 'heavy'
 

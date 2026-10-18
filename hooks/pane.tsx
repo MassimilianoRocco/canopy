@@ -2,28 +2,29 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface, RenderElement } from 'claude-code'
 
 import type { FileText, Lang, Mode, OpenedFile, Snapshot, TurnRecord } from '../types'
-import { changesOf, diffLines, hunksOf, linesOf, unifiedSource } from './diff'
-import type { DiffLine } from './diff'
+import { changesOf, clipHunk, diffLines, hunksOf, linesOf, unifiedSource } from './diff'
+import type { DiffLine, Hunk } from './diff'
 import { compareIn, currentEditor, openIn, writeSide } from './editor'
-import { HEAVY, HIDDEN, headOf, indexOf, textOf } from './git'
+import { BADGE_MIN_COLUMNS, fileBadgeOf } from './filetype'
+import type { Launch } from './editor'
+import { HEAVY, HIDDEN, headOf, indexOf, rootOf, textOf } from './git'
 import {
-  LETTERS,
   TONE_COLOR,
   TONE_OF_CODE,
-  TONE_OF_LETTER,
   badgeOf,
+  countsOf,
   hasDiff,
   isDimTone,
   isRead,
-  letterOf,
   noteOf,
   rangesText,
   statusColorOf,
   toneOf,
   turnStatusOf,
+  wordOf,
 } from './model'
-import { isUnder, joinPath, keyOf, labelOf, slashes, splitLabel, tidy } from './paths'
-import { isScanning, refreshCatalog, rootOf, runScan, scheduleScan } from './scan'
+import { isUnder, joinPath, keyOf, labelOf, splitLabel, tidy } from './paths'
+import { hasScanned, isScanning, refreshCatalog, runScan, scheduleScan } from './scan'
 import { STRINGS } from './text'
 import type { Tone, TreeRow } from './tree'
 
@@ -48,10 +49,18 @@ const MAX_ROWS = 800
 const MAX_CHANGES = 40
 const MAX_MATCHES = 150
 const MAX_PROPS = 90_000
+// The code one file view draws: the engine draws a tree's first 100,000
+// characters of text, and a Code it cuts loses its colours. Each block of
+// changes costs its label and its editor button besides its code
+const MAX_CODE = 90_000
+const HUNK_LABEL = 40
 
-// The sections' folds, kept with the folders' own: Changes open, the others closed
+// The sections' folds, kept with the folders' own: Changes and the project
+// open, Other changes and Outside the project closed
 const CHANGES = 'section:changes'
 const OTHERS = 'section:others'
+const ELSEWHERE = 'section:elsewhere'
+const PROJECT = 'section:project'
 
 /** One entry of a section's list, whichever mode drew it. */
 type Change = {
@@ -59,9 +68,10 @@ type Change = {
   path: string
   label: string
   tone: Tone
-  /** Its status letter: M, A, U, D, R or !. */
-  letter: string | undefined
-  note?: string
+  /** What its colour says, where it is more than a modification: `new`, `deleted`. */
+  word?: string
+  /** Its lines added and removed, once counted. */
+  counts?: [number, number]
 }
 
 /** What a row of the desktop's list does when clicked. */
@@ -85,7 +95,9 @@ type Row = {
 
 // What each drawing showed, by generation: a click lands on the row the
 // person saw, even when a tool call redrew the pane in between
-const DRAWN_KEEP = 4
+// A click on a drawing older than these is dropped: kept generous, since
+// counts and scans redraw the pane while a turn runs
+const DRAWN_KEEP = 32
 const drawn = new Map<number, (Target | null)[]>()
 let generation = 0
 
@@ -226,38 +238,54 @@ export async function renderPane(
   const editorName = await read($, editor)
   const ide = editorName === null ? undefined : currentEditor()
 
-  // The commit view before any scan: git asked once, off this drawing
-  if (how === 'commit' && status === null && !isScanning()) scheduleScan($, 0)
+  // The commit view before any scan: git asked once, off this drawing. Once only:
+  // outside a repository its answer stays null, and asking on every null would loop
+  if (how === 'commit' && status === null && !hasScanned() && !isScanning()) scheduleScan($, 0)
 
   // ---- What the colours say: the turn's changes, or git's ----
+  const baseKey = keyOf(base)
   const changes: Change[] = []
   const others: Change[] = []
+  // What the turn changed outside the project (a scratch file, a setting in the home
+  // folder): listed apart, folded, and left out of the project's summary
+  const elsewhere: Change[] = []
   if (how === 'turn') {
     for (const one of turn?.files ?? []) {
       const tone = toneOf(one)
       if (tone === 'read') continue
-      const letter = tone === 'outside' ? (one.isCreated ? 'A' : 'M') : letterOf(tone)
-      ;(tone === 'outside' ? others : changes).push({ key: one.key, path: one.path, label: one.label, tone, letter })
+      const word = tone === 'outside' ? (one.isCreated ? s.stateNew : undefined) : wordOf(s, tone)
+      const counts = countsOf(one)
+      const isElsewhere = baseKey !== '' && !isUnder(one.key, baseKey)
+      ;(isElsewhere ? elsewhere : tone === 'outside' ? others : changes).push({
+        key: one.key,
+        path: one.path,
+        label: one.label,
+        tone,
+        ...(word === undefined ? {} : { word }),
+        ...(counts === undefined ? {} : { counts }),
+      })
     }
   } else if (status !== null) {
     for (const one of status.files) {
       const path = `${status.top}/${one.rel}`
       const tone = TONE_OF_CODE[one.code]
-      const note = s.notes[one.code]
+      const word = wordOf(s, tone, one.code)
+      const counts = countsOf(one)
       changes.push({
         key: keyOf(path),
         path,
         label: labelOf(path, base),
         tone,
-        letter: letterOf(tone, one.code),
-        ...(note === undefined ? {} : { note }),
+        ...(word === undefined ? {} : { word }),
+        ...(counts === undefined ? {} : { counts }),
       })
     }
   }
   const byLabel = (a: Change, b: Change) => (a.label.toLowerCase() < b.label.toLowerCase() ? -1 : 1)
   changes.sort(byLabel)
   others.sort(byLabel)
-  const byKey = new Map([...changes, ...others].map(one => [one.key, one]))
+  elsewhere.sort(byLabel)
+  const byKey = new Map([...changes, ...others, ...elsewhere].map(one => [one.key, one]))
 
   // Moves from the turn shown now; landing on the latest follows new turns again
   const step = (delta: number) => async () => {
@@ -288,18 +316,18 @@ export async function renderPane(
           </Box>
           {list.length > 1 && (
             <Box flexDirection="row" gap={1}>
-              {index > 0 && <Button key="prev" label="◀" onPress={step(-1)} />}
-              <Text dimColor>
+              {index > 0 && <Button key="prev" label="‹" onPress={step(-1)} />}
+              <Text dimColor tabular>
                 {index + 1}/{list.length}
               </Text>
-              {index < list.length - 1 && <Button key="next" label="▶" onPress={step(1)} />}
+              {index < list.length - 1 && <Button key="next" label="›" onPress={step(1)} />}
             </Box>
           )}
         </Box>
         {/* The code wants the room in the file view */}
         {file === null && turn.prompt !== '' && (
           <Text dimColor italic wrap="truncate-end">
-            “{turn.prompt}”
+            {turn.prompt}
           </Text>
         )}
       </Box>
@@ -310,7 +338,8 @@ export async function renderPane(
     const view = await read($, diffView)
     const record = touched.get(file.key)
     const change = byKey.get(file.key)
-    const pool = others.some(one => one.key === file.key) ? others : changes
+    // The arrows walk the list the file stands in
+    const pool = [elsewhere, others].find(list => list.some(one => one.key === file.key)) ?? changes
     const at = pool.findIndex(one => one.key === file.key)
     const tone = change?.tone ?? ''
 
@@ -323,7 +352,9 @@ export async function renderPane(
       const entry =
         status === null ? undefined : status.files.find(one => keyOf(`${status.top}/${one.rel}`) === file.key)
       if (status !== null && entry !== undefined) {
-        before = entry.code === '?' || entry.code === 'A' ? { kind: 'missing' } : await headOf($, status, entry.rel)
+        // A rename's last commit is under its old path
+        before =
+          entry.code === '?' || entry.code === 'A' ? { kind: 'missing' } : await headOf($, status, entry.from ?? entry.rel)
         against = 'head'
       }
     } else {
@@ -340,9 +371,14 @@ export async function renderPane(
 
     // ---- The editor: the file at a line, or its own diff of this turn ----
     const isLatest = how === 'commit' || index === list.length - 1
+    // What went wrong, said: a start that failed, or a name a script launcher would misread
+    const tell = async (how: Launch) => {
+      if (ide === undefined || how === 'started') return
+      await $.ui.toast(how === 'refused' ? s.editorRefused(ide.name) : s.editorFailed(ide.name))
+    }
     const toEditor = (line: number) => async () => {
       if (ide === undefined) return
-      if (!(await openIn($, ide, file.path, line))) await $.ui.toast(s.editorFailed(ide.name))
+      await tell(await openIn($, ide, file.path, line))
     }
     const compare = async () => {
       if (ide === undefined || before === undefined || before.kind === 'too-large') return
@@ -353,7 +389,7 @@ export async function renderPane(
         isLatest || after.kind !== 'text' || turn === undefined
           ? file.path
           : await writeSide($, file.key, file.label, s.afterTurn(turn.number), after.text)
-      if (!(await compareIn($, ide, left, right))) await $.ui.toast(s.editorFailed(ide.name))
+      await tell(await compareIn($, ide, left, right))
     }
 
     const plain = (text: string) =>
@@ -381,6 +417,9 @@ export async function renderPane(
         body = plain(after.kind === 'text' ? after.text : '')
       } else {
         firstLine = counts.ranges[0]![0]
+        // Past the drawing's room the whole file would be cut and lose its colours: its changes it is
+        const isWholeTooLarge = lines.reduce((size, line) => size + line.text.length + 2, 0) > MAX_CODE
+        if (isWholeTooLarge) note = s.wholeTooLarge
         stats = (
           <Box flexDirection="row" gap={1}>
             <Text color="success">+{counts.added}</Text>
@@ -390,7 +429,7 @@ export async function renderPane(
             </Text>
           </Box>
         )
-        toggle = (
+        toggle = isWholeTooLarge ? undefined : (
           <Box flexDirection="row" gap={1}>
             <Button key="view:full" {...primaryIf(view === 'full')} onPress={() => update($, diffView, () => 'full')}>
               {s.wholeFile}
@@ -400,11 +439,31 @@ export async function renderPane(
             </Button>
           </Box>
         )
-        // Only the changes: one block each, its lines named, and the editor a click away
+        // Only the changes: one block each, its lines named, and the editor a click away; as
+        // many as the room holds, the last one cut at a line when it alone runs past it
+        const blocks: Hunk[] = []
+        let room = MAX_CODE
+        let isCutShort = false
+        if (view === 'hunks' || isWholeTooLarge) {
+          for (const hunk of hunksOf(lines)) {
+            const fits = hunk.source.length <= room ? hunk : clipHunk(hunk, room)
+            if (fits === undefined) {
+              isCutShort = true
+              break
+            }
+            blocks.push(fits)
+            room -= fits.source.length + HUNK_LABEL
+            if (fits !== hunk) {
+              isCutShort = true
+              break
+            }
+          }
+        }
         body =
-          view === 'hunks' ? (
+          view === 'hunks' || isWholeTooLarge ? (
             <Box flexDirection="column">
-              {hunksOf(lines).map((hunk, n) => (
+              {blocks.length === 0 && <Text dimColor>{s.tooLarge}</Text>}
+              {blocks.map((hunk, n) => (
                 <Box key={`hunk:${n}`} flexDirection="column" marginTop={n === 0 ? 0 : 1}>
                   <Box flexDirection="row" justifyContent="space-between" gap={1}>
                     <Text dimColor size="footnote">
@@ -417,6 +476,11 @@ export async function renderPane(
                   <Code source={hunk.source} format="diff" path={file.path} />
                 </Box>
               ))}
+              {isCutShort && blocks.length > 0 && (
+                <Text key="hunks:rest" dimColor size="footnote">
+                  {s.restNotDrawn}
+                </Text>
+              )}
             </Box>
           ) : (
             <Code source={unifiedSource(lines)} format="diff" path={file.path} />
@@ -436,7 +500,7 @@ export async function renderPane(
       .filter(part => part !== '')
       .join(' › ')
     const words = [
-      how === 'turn' && record !== undefined ? badgeOf(s, record) : (change?.note ?? ''),
+      how === 'turn' && record !== undefined ? badgeOf(s, record) : (change?.word ?? ''),
       note,
     ].filter(text => text !== '')
     const prev = pool[(at - 1 + pool.length) % pool.length]
@@ -459,16 +523,9 @@ export async function renderPane(
           )}
         </Box>
         <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" gap={1} marginTop={1}>
-          <Box flexDirection="row" gap={1}>
-            <Text bold color={TONE_COLOR[tone]} dimColor={tone === 'outside'} strikethrough={tone === 'deleted'}>
-              {name}
-            </Text>
-            {change?.letter !== undefined && (
-              <Text bold color={TONE_COLOR[tone]} dimColor={isDimTone(tone)}>
-                {change.letter}
-              </Text>
-            )}
-          </Box>
+          <Text bold color={TONE_COLOR[tone]} dimColor={tone === 'outside'} strikethrough={tone === 'deleted'}>
+            {name}
+          </Text>
           {ide !== undefined && after.kind === 'text' && (
             <Box flexDirection="row" gap={1}>
               <Button key="editor:open" onPress={toEditor(firstLine)}>
@@ -497,7 +554,7 @@ export async function renderPane(
             {s.outside}
           </Text>
         )}
-        {stats !== undefined && toggle !== undefined && (
+        {stats !== undefined && (
           <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" gap={1} marginTop={1}>
             {stats}
             {toggle}
@@ -511,10 +568,11 @@ export async function renderPane(
   }
 
   // ---- The tree, the sections above it, or the search's results ----
-  const baseKey = keyOf(base)
   const manual = await read($, toggled)
   const isChangesFolded = manual[CHANGES] === false
   const isOthersOpen = manual[OTHERS] === true
+  const isElsewhereOpen = manual[ELSEWHERE] === true
+  const isProjectOpen = manual[PROJECT] !== false
   const text = await read($, query)
   const known = await read($, catalog)
   const ignored = new Set(known?.ignored ?? [])
@@ -586,14 +644,21 @@ export async function renderPane(
   if (isSearching && files === undefined) refreshCatalog($, status)
   const matches = files === undefined ? [] : search(files, text)
   const results = treeOf(matches.slice(0, MAX_MATCHES), baseKey)
-  if (!isSearching && base !== '') await walk(base, 0, false)
+  // A folded project isn't walked: nothing of it is drawn
+  if (!isSearching && base !== '' && isProjectOpen) await walk(base, 0, false)
 
-  // A row's tone, letter and dim words, the same on every surface
+  // A row's tone, dim words and mark, the same on every surface
   const isMarked = (key: string) => marked.get(key) === 'changed'
   const toneOfFile = (key: string, isDim: boolean): Tone => byKey.get(key)?.tone ?? (isDim ? 'heavy' : '')
   const toneOfDir = (key: string, isDim: boolean): Tone => (isMarked(key) ? 'changed' : isDim ? 'heavy' : '')
-  const noteOfFile = (key: string) => (how === 'turn' ? noteOf(s, touched.get(key)) : undefined)
-  const folderOf = (one: Change) => tidy(splitLabel(one.label).dir)
+  // In the tree: what the colour says, or a read file's words
+  const noteOfFile = (key: string) =>
+    byKey.get(key)?.word ?? (how === 'turn' ? noteOf(s, touched.get(key)) : undefined)
+  // A refused edit or a conflict has no lines to count: a mark says it
+  const markOf = (tone: Tone) => (tone === 'failed' ? '!' : undefined)
+  // In a section: the folder, then what the colour says
+  const folderOf = (one: Change) =>
+    [tidy(splitLabel(one.label).dir), one.word ?? ''].filter(part => part !== '').join(' · ')
   const pathOf = (rel: string) => joinPath(base, rel.replace(/\//g, base.includes('\\') ? '\\' : '/'))
 
   // ---- Above the list: the view, the search, then the counts, which are the legend too ----
@@ -649,51 +714,51 @@ export async function renderPane(
     </Box>
   )
 
-  const counts = new Map<string, number>()
-  for (const one of changes) {
-    if (one.letter !== undefined) counts.set(one.letter, (counts.get(one.letter) ?? 0) + 1)
-  }
+  // ---- The summary: how many files, their lines, and what else the turn did ----
   const readOnly = how === 'turn' ? (turn?.files.filter(isRead).length ?? 0) : 0
   const commands = how === 'turn' ? (turn?.commands ?? 0) : 0
+  const added = changes.reduce((sum, one) => sum + (one.counts?.[0] ?? 0), 0)
+  const removed = changes.reduce((sum, one) => sum + (one.counts?.[1] ?? 0), 0)
   const extras = [
     readOnly > 0 ? s.reads(readOnly) : '',
     commands > 0 ? s.commands(commands) : '',
     others.length > 0 ? s.others(others.length) : '',
+    elsewhere.length > 0 ? s.elsewhere(elsewhere.length) : '',
     how === 'commit' && changes.length > 0 ? s.sinceCommit : '',
   ].filter(one => one !== '')
   const notice =
     how === 'commit'
       ? status === null
-        ? isScanning() ? s.askingGit : s.noRepo
+        ? !hasScanned() || isScanning() ? s.askingGit : s.noRepo
         : changes.length === 0 ? s.noChangesCommit : ''
-      : turn !== undefined && changes.length === 0 && others.length === 0 && readOnly === 0
+      : turn !== undefined && changes.length === 0 && others.length === 0 && elsewhere.length === 0 && readOnly === 0
         ? s.nothingTouched
         : ''
-  const counters = (counts.size > 0 || extras.length > 0 || notice !== '') && (
-    <Box flexDirection="row" flexWrap="wrap" columnGap={2} marginTop={1}>
-      {LETTERS.filter(letter => counts.has(letter)).map(letter => {
-        const count = counts.get(letter) ?? 0
-        const [one, many] = s.words[letter]!
-        const tone = TONE_OF_LETTER[letter]!
-
-        return (
-          <Box key={`count:${letter}`} flexDirection="row" gap={1}>
-            <Text bold size="footnote" color={TONE_COLOR[tone]} dimColor={tone === 'deleted'}>
-              {letter}
-            </Text>
-            <Text dimColor size="footnote">
-              {count} {count === 1 ? one : many}
-            </Text>
-          </Box>
-        )
-      })}
+  const summary = (changes.length > 0 || extras.length > 0 || notice !== '') && (
+    <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
+      {changes.length > 0 && (
+        <Text key="sum:files" size="footnote">
+          {s.files(changes.length)}
+        </Text>
+      )}
+      {added > 0 && (
+        <Text key="sum:added" size="footnote" color="success" tabular>
+          +{added}
+        </Text>
+      )}
+      {removed > 0 && (
+        <Text key="sum:removed" size="footnote" color="error" tabular>
+          −{removed}
+        </Text>
+      )}
       {extras.length > 0 && (
-        <Text dimColor size="footnote">
+        <Text key="sum:extras" dimColor size="footnote">
+          {changes.length > 0 ? '· ' : ''}
           {extras.join(' · ')}
         </Text>
       )}
       {notice !== '' && (
-        <Text dimColor size="footnote">
+        <Text key="sum:notice" dimColor size="footnote">
           {notice}
         </Text>
       )}
@@ -709,8 +774,11 @@ export async function renderPane(
         ? s.noMatch(text.trim())
         : s.matches(matches.length)
   const moreMatches = matches.length > MAX_MATCHES ? s.moreMatches(matches.length - MAX_MATCHES) : ''
+  // How long the search's first word is, marked where a found name holds it
+  const matchLength = text.trim().split(/\s+/)[0]?.length ?? 0
 
-  const projectName = slashes(base).split('/').filter(part => part !== '').at(-1) ?? base
+  const projectPath = tidy(labelOf(base, ''))
+  const hasSections = changes.length > 0 || others.length > 0 || elsewhere.length > 0
   let isCut = rows.length >= MAX_ROWS
   let lists: RenderElement
 
@@ -731,25 +799,34 @@ export async function renderPane(
 
       return true
     }
+    // A file's row: its badge and colour, then its lines added and removed or its mark, the same in every list.
+    // The badge always travels: the list itself drops it where it is narrow
+    const fileLine = (key: string, tone: Tone, extra: Partial<TreeRow>, t: string): TreeRow => {
+      const counts = byKey.get(key)?.counts
+      const mark = markOf(tone)
+      const badge = fileBadgeOf(t)
+
+      return {
+        t,
+        c: tone,
+        k: 'f',
+        ...extra,
+        ...(badge[0] === '' ? {} : { b: badge }),
+        ...(counts === undefined ? {} : { s: counts }),
+        ...(mark === undefined ? {} : { m: mark }),
+      }
+    }
+    const heading = (key: string, title: string, words: string, isOpen: boolean) =>
+      add({ kind: 'dir', key, isOpen }, { t: title, c: '', k: 'g', n: words, ...(isOpen ? { o: 1 as const } : {}) })
     const section = (key: string, title: string, entries: readonly Change[], isOpen: boolean) => {
       if (entries.length === 0) return
-      add(
-        { kind: 'dir', key, isOpen },
-        { t: `${isOpen ? '▾' : '▸'} ${title}`, c: '', k: 'g', n: String(entries.length), ...(isOpen ? { o: 1 as const } : {}) },
-      )
+      heading(key, title, String(entries.length), isOpen)
       if (!isOpen) return
       for (const one of entries.slice(0, MAX_CHANGES)) {
         const folder = folderOf(one)
         add(
           { kind: 'file', key: one.key, path: one.path, label: one.label },
-          {
-            t: splitLabel(one.label).name,
-            c: one.tone,
-            k: 'f',
-            i: 1,
-            ...(one.letter === undefined ? {} : { m: one.letter }),
-            ...(folder === '' ? {} : { n: folder }),
-          },
+          fileLine(one.key, one.tone, { i: 1, ...(folder === '' ? {} : { n: folder }) }, splitLabel(one.label).name),
         )
       }
       if (entries.length > MAX_CHANGES) add(null, { t: s.more(entries.length - MAX_CHANGES), c: '', k: 'x', i: 1 })
@@ -764,30 +841,21 @@ export async function renderPane(
         if (one.kind === 'dir') {
           add(
             { kind: 'reveal', keys: one.keys },
-            { t: `▾ ${one.name}`, c: toneOfDir(key, false), k: 'd', o: 1, ...depth, ...(isMarked(key) ? { m: '●' } : {}) },
+            { t: one.name, c: toneOfDir(key, false), k: 'd', o: 1, ...depth, ...(isMarked(key) ? { m: '●' } : {}) },
           )
         } else {
-          const letter = byKey.get(key)?.letter
-          add(
-            { kind: 'file', key, path, label: one.rel },
-            {
-              t: `  ${one.name}`,
-              c: toneOfFile(key, false),
-              k: 'f',
-              ...depth,
-              ...(letter === undefined ? {} : { m: letter }),
-              ...(one.at < 0 ? {} : { h: [one.at + 2, one.at + 2 + text.trim().split(/\s+/)[0]!.length] as [number, number] }),
-            },
-          )
+          const match = one.at < 0 || matchLength === 0 ? {} : { h: [one.at, one.at + matchLength] as [number, number] }
+          add({ kind: 'file', key, path, label: one.rel }, fileLine(key, toneOfFile(key, false), { ...depth, ...match }, one.name))
         }
       }
       if (moreMatches !== '') add(null, { t: moreMatches, c: '', k: 'x' })
     } else {
       section(CHANGES, s.changes, changes, !isChangesFolded)
       section(OTHERS, s.otherChanges, others, isOthersOpen)
-      if (changes.length > 0 || others.length > 0) add(null, { t: ' ', c: '', k: 'x' })
-      add(null, { t: projectName, c: '', k: 'h', n: tidy(labelOf(base, '')) })
-      for (const row of rows) {
+      section(ELSEWHERE, s.outsideProject, elsewhere, isElsewhereOpen)
+      if (hasSections) add(null, { t: ' ', c: '', k: 'x' })
+      heading(PROJECT, s.project, projectPath, isProjectOpen)
+      for (const row of isProjectOpen ? rows : []) {
         const depth = row.depth > 0 ? { d: row.depth } : {}
         let isAdded: boolean
         if (row.kind === 'more') {
@@ -796,7 +864,7 @@ export async function renderPane(
           isAdded = add(
             { kind: 'dir', key: row.key, isOpen: row.isOpen },
             {
-              t: `${row.isOpen ? '▾' : '▸'} ${row.name}`,
+              t: row.name,
               c: toneOfDir(row.key, row.isDim),
               k: 'd',
               ...depth,
@@ -805,18 +873,10 @@ export async function renderPane(
             },
           )
         } else {
-          const letter = byKey.get(row.key)?.letter
           const note = noteOfFile(row.key)
           isAdded = add(
             { kind: 'file', key: row.key, path: row.path, label: labelOf(row.path, base) },
-            {
-              t: `  ${row.name}`,
-              c: toneOfFile(row.key, row.isDim),
-              k: 'f',
-              ...depth,
-              ...(letter === undefined ? {} : { m: letter }),
-              ...(note === undefined ? {} : { n: note }),
-            },
+            fileLine(row.key, toneOfFile(row.key, row.isDim), { ...depth, ...(note === undefined ? {} : { n: note }) }, row.name),
           )
         }
         if (!isAdded) break
@@ -840,12 +900,52 @@ export async function renderPane(
   } else {
     // The terminal keeps a Button's label colours: Buttons it is
     const toggle = (key: string, isOpen: boolean) => () => update($, toggled, current => ({ ...current, [key]: !isOpen }))
-    const letterText = (letter: string | undefined, tone: Tone) =>
-      letter !== undefined && (
-        <Text bold color={TONE_COLOR[tone]} dimColor={isDimTone(tone)}>
-          {letter}
+    // After a file's name: its lines added and removed, or its mark
+    const tail = (key: string, tone: Tone) => {
+      const counts = byKey.get(key)?.counts
+      const mark = markOf(tone)
+      if ((counts === undefined || counts[0] + counts[1] === 0) && mark === undefined) return undefined
+
+      return (
+        <Box key={`tail:${key}`} flexDirection="row" gap={1}>
+          {counts !== undefined && counts[0] > 0 && (
+            <Text color="success" dimColor={isDimTone(tone)}>
+              +{counts[0]}
+            </Text>
+          )}
+          {counts !== undefined && counts[1] > 0 && (
+            <Text color="error" dimColor={isDimTone(tone)}>
+              −{counts[1]}
+            </Text>
+          )}
+          {mark !== undefined && (
+            <Text bold color={TONE_COLOR.failed}>
+              {mark}
+            </Text>
+          )}
+        </Box>
+      )
+    }
+    const chevron = (isOpen: boolean) => (
+      <Text color="subtle" bold={false}>
+        {isOpen ? '▾ ' : '▸ '}
+      </Text>
+    )
+
+    // A file's badge before its name: its letters in their colour (a terminal draws no faint
+    // tint), the room kept blank for a file with none; none at all in a narrow pane
+    const paneColumns = (e as { props?: { bodyColumns?: unknown } }).props?.bodyColumns
+    const isBadged = typeof paneColumns !== 'number' || paneColumns >= BADGE_MIN_COLUMNS
+    const badgeText = (key: string, name: string, tone: Tone) => {
+      if (!isBadged) return undefined
+      const [letters, color] = fileBadgeOf(name)
+
+      return (
+        <Text key={`badge:${key}`} bold color={color} dimColor={isDimTone(tone)}>
+          {letters.padEnd(2)}
         </Text>
       )
+    }
 
     const fileButton = (key: string, path: string, label: string, name: string, tone: Tone) => (
       <Button key={`file:${key}`} plain onPress={open({ key, path, label })}>
@@ -870,7 +970,8 @@ export async function renderPane(
           <Box key={row.key} flexDirection="row" gap={1} paddingLeft={row.depth * 2}>
             <Button key={`dir:${row.key}`} plain dimColor={row.isDim} onPress={toggle(row.key, row.isOpen)}>
               <Text color={TONE_COLOR[tone]} dimColor={row.isDim}>
-                {row.isOpen ? '▾' : '▸'} {row.name}
+                {chevron(row.isOpen)}
+                {row.name}
               </Text>
             </Button>
             {isMarked(row.key) && <Text color={TONE_COLOR.changed}>●</Text>}
@@ -882,37 +983,46 @@ export async function renderPane(
 
       return (
         <Box key={row.key} flexDirection="row" gap={1} paddingLeft={row.depth * 2 + 2}>
+          {badgeText(row.key, row.name, tone)}
           {fileButton(row.key, row.path, labelOf(row.path, base), row.name, tone)}
-          {letterText(byKey.get(row.key)?.letter, tone)}
           {note !== undefined && <Text dimColor>{note}</Text>}
+          {tail(row.key, tone)}
         </Box>
       )
     }
 
+    const headingOf = (key: string, title: string, words: string, isOpen: boolean) => (
+      <Box key={`head:${key}`} flexDirection="row" gap={1}>
+        <Button key={key} plain onPress={toggle(key, isOpen)}>
+          <Text bold>
+            {chevron(isOpen)}
+            {title}
+          </Text>
+        </Button>
+        <Text dimColor wrap="truncate-start">
+          {words}
+        </Text>
+      </Box>
+    )
+
     const sectionOf = (key: string, title: string, entries: readonly Change[], isOpen: boolean) =>
       entries.length > 0 && (
         <Box key={key} flexDirection="column" marginTop={1}>
-          <Box flexDirection="row" gap={1}>
-            <Button key={key} plain onPress={toggle(key, isOpen)}>
-              <Text bold>
-                {isOpen ? '▾' : '▸'} {title}
-              </Text>
-            </Button>
-            <Text dimColor>{entries.length}</Text>
-          </Box>
+          {headingOf(key, title, String(entries.length), isOpen)}
           {isOpen &&
             entries.slice(0, MAX_CHANGES).map(one => {
               const folder = folderOf(one)
 
               return (
                 <Box key={`row:${one.key}`} flexDirection="row" gap={1} paddingLeft={2}>
+                  {badgeText(one.key, splitLabel(one.label).name, one.tone)}
                   <Button key={`chg:${one.key}`} plain onPress={openChange(one)}>
                     <Text color={TONE_COLOR[one.tone]} dimColor={isDimTone(one.tone)} strikethrough={one.tone === 'deleted'}>
                       {splitLabel(one.label).name}
                     </Text>
                   </Button>
-                  {letterText(one.letter, one.tone)}
                   {folder !== '' && <Text dimColor>{folder}</Text>}
+                  {tail(one.key, one.tone)}
                 </Box>
               )
             })}
@@ -934,7 +1044,10 @@ export async function renderPane(
             return (
               <Box key={`found:${key}`} flexDirection="row" gap={1} paddingLeft={one.depth * 2}>
                 <Button key={`reveal:${key}`} plain onPress={() => reveal($, one.keys)}>
-                  <Text color={TONE_COLOR[toneOfDir(key, false)]}>▾ {one.name}</Text>
+                  <Text color={TONE_COLOR[toneOfDir(key, false)]}>
+                    {chevron(true)}
+                    {one.name}
+                  </Text>
                 </Button>
               </Box>
             )
@@ -943,8 +1056,9 @@ export async function renderPane(
 
           return (
             <Box key={`found:${key}`} flexDirection="row" gap={1} paddingLeft={one.depth * 2 + 2}>
+              {badgeText(key, one.name, tone)}
               {fileButton(key, path, one.rel, one.name, tone)}
-              {letterText(byKey.get(key)?.letter, tone)}
+              {tail(key, tone)}
             </Box>
           )
         })}
@@ -954,14 +1068,10 @@ export async function renderPane(
       <Box flexDirection="column">
         {sectionOf(CHANGES, s.changes, changes, !isChangesFolded)}
         {sectionOf(OTHERS, s.otherChanges, others, isOthersOpen)}
+        {sectionOf(ELSEWHERE, s.outsideProject, elsewhere, isElsewhereOpen)}
         <Box flexDirection="column" marginTop={1}>
-          <Box flexDirection="row" gap={1}>
-            <Text bold>{projectName}</Text>
-            <Text dimColor wrap="truncate-start">
-              {tidy(labelOf(base, ''))}
-            </Text>
-          </Box>
-          {rows.map(rowOf)}
+          {headingOf(PROJECT, s.project, projectPath, isProjectOpen)}
+          {isProjectOpen && rows.map(rowOf)}
         </Box>
       </Box>
     )
@@ -970,9 +1080,9 @@ export async function renderPane(
   return (
     <Box flexDirection="column">
       {header}
+      {summary}
       {controls}
       {searchRow}
-      {counters}
       {lists}
       {isCut && <Text dimColor>{s.cut}</Text>}
     </Box>

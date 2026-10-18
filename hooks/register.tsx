@@ -4,11 +4,11 @@ import type { Register } from 'claude-code'
 import type { Lang, TouchedFile, TurnRecord } from '../types'
 import { findEditor, setEditor } from './editor'
 import type { EditorChoice } from './editor'
-import { textOf } from './git'
-import { hasDiff, isClaude, withFile, withLast } from './model'
+import { rootOf, textOf } from './git'
+import { isBlank, isClaude, withFile, withLast, withTurn } from './model'
 import { PANE, actOn, renderPane } from './pane'
 import { isRecord, keyOf, labelOf } from './paths'
-import { captureStart, refreshCatalog, rootOf, scheduleScan, settleScan, stopScans } from './scan'
+import { captureStart, countLater, refreshCatalog, scheduleScan, settleScan, stopScans } from './scan'
 import { STRINGS, detectLang } from './text'
 
 const history = atom({ plugin: 'canopy', key: 'history' } as const, [])
@@ -28,6 +28,15 @@ const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
 
 const LANGS = new Set<string>(['en', 'it'])
 const EDITORS = new Set<string>(['auto', 'intellij', 'vscode', 'off'])
+
+/** Clears every text kept for these turns' diffs, a refused edit's too: they leave the history. */
+async function forget($: Parameters<typeof read>[0], turns: readonly TurnRecord[]) {
+  for (const turn of turns) {
+    for (const file of turn.files) {
+      await update($, atom({ ...SNAPSHOT, id: `${turn.id}|${file.key}` }, {}), () => ({}))
+    }
+  }
+}
 
 export const register: Register = (on, options) => {
   const keep = Math.min(20, Math.max(2, Number(options['turns'] ?? 10) || 10))
@@ -81,6 +90,7 @@ export const register: Register = (on, options) => {
   on('session.end', async ($, e, next) => {
     stopScans()
     if (e.reason === 'clear') {
+      await forget($, await read($, history))
       await update($, history, () => [])
       await update($, shown, () => null)
       await update($, opened, () => null)
@@ -96,12 +106,7 @@ export const register: Register = (on, options) => {
     await settleScan($)
     const startedAt = await $.clock.now()
     const before = await read($, history)
-    const dropped = before.slice(0, Math.max(0, before.length - keep + 1))
-    for (const turn of dropped) {
-      for (const file of turn.files.filter(hasDiff)) {
-        await update($, atom({ ...SNAPSHOT, id: `${turn.id}|${file.key}` }, {}), () => ({}))
-      }
-    }
+    await forget($, before.slice(0, Math.max(0, before.length - keep + 1)))
 
     await update($, history, list => {
       const turn: TurnRecord = {
@@ -129,8 +134,19 @@ export const register: Register = (on, options) => {
 
   on('turn.complete', async ($, e, next) => {
     if (e.agentId === undefined) {
+      // A command still running in the background is Claude's up to here; what it writes later, another turn's
+      const endedAt = await $.clock.now()
       await update($, history, list =>
-        list.map(turn => (turn.id === e.turnId ? { ...turn, durationMs: e.durationMs, endReason: e.reason } : turn)),
+        list.map(turn =>
+          turn.id === e.turnId
+            ? {
+                ...turn,
+                durationMs: e.durationMs,
+                endReason: e.reason,
+                runs: turn.runs.map(([from, to]): [number, number] => [from, to < 0 ? endedAt : to]),
+              }
+            : turn,
+        ),
       )
       // The texts as the turn left them, so an older turn's diff stays its own
       const turn = (await read($, history)).find(one => one.id === e.turnId)
@@ -138,6 +154,7 @@ export const register: Register = (on, options) => {
         if (file.via !== undefined && file.edits === 0) continue
         const after = await textOf($, file.path)
         await update($, atom({ ...SNAPSHOT, id: `${e.turnId}|${file.key}` }, {}), current => ({ ...current, after }))
+        countLater($, e.turnId, file.key)
       }
       // What changed without a file tool (a command, a hook, an editor): asked once the answer is out
       scheduleScan($, 0)
@@ -175,22 +192,28 @@ export const register: Register = (on, options) => {
     if (touch.kind === 'command') {
       // When it runs, so what it writes is told from what anything else writes
       const from = await $.clock.now()
+      const turnId = (await read($, history)).at(-1)?.id ?? 'orphan'
       let slot = -1
       await update($, history, list =>
-        withLast(list, turn => {
+        withTurn(list, turnId, turn => {
           slot = turn.runs.length
 
           return { ...turn, commands: turn.commands + 1, runs: [...turn.runs, [from, -1]] }
         }),
       )
       const ran = await next(e)
-      const to = await $.clock.now()
-      await update($, history, list =>
-        withLast(list, turn => ({
-          ...turn,
-          runs: turn.runs.map((run, at): [number, number] => (at === slot ? [run[0], to] : run)),
-        })),
-      )
+      // In the background (asked so, or sent there with Ctrl+B) the command goes on once the
+      // call returns: its run stays open until the turn ends
+      const isBackground = isRecord(ran.result) && typeof ran.result['backgroundTaskId'] === 'string'
+      if (!isBackground) {
+        const to = await $.clock.now()
+        await update($, history, list =>
+          withTurn(list, turnId, turn => ({
+            ...turn,
+            runs: turn.runs.map((run, at): [number, number] => (at === slot ? [run[0], to] : run)),
+          })),
+        )
+      }
       // What the command wrote, git tells a moment later: never on this path
       scheduleScan($)
 
@@ -202,8 +225,8 @@ export const register: Register = (on, options) => {
     const pending = touch.kind === 'read' ? 'read' : 'edit'
 
     // Before the turn's first change to the file: what its diff starts from
+    const turnId = (await read($, history)).at(-1)?.id ?? 'orphan'
     if (pending === 'edit') {
-      const turnId = (await read($, history)).at(-1)?.id ?? 'orphan'
       const snapshot = atom({ ...SNAPSHOT, id: `${turnId}|${seed.key}` }, {})
       if ((await read($, snapshot)).before === undefined) {
         const was = await textOf($, touch.path)
@@ -212,33 +235,40 @@ export const register: Register = (on, options) => {
     }
 
     await update($, history, list =>
-      withLast(list, turn => withFile(turn, seed, file => ({ ...file, running: file.running + 1, pending }))),
+      withTurn(list, turnId, turn => withFile(turn, seed, file => ({ ...file, running: file.running + 1, pending }))),
     )
 
     const ran = await next(e)
     const isDone = ran.deny === undefined && ran.isError !== true
     const isCreated = isDone && touch.kind === 'write' && isRecord(ran.result) && ran.result.type === 'create'
 
+    // On the turn it began in: a subagent's call may end after a new turn started
     await update($, history, list =>
-      withLast(list, turn =>
-        withFile(turn, seed, (file): TouchedFile => {
+      withTurn(list, turnId, turn => {
+        const settled = withFile(turn, seed, (file): TouchedFile => {
           const running = Math.max(0, file.running - 1)
           const settled = { ...file, running, pending: running > 0 ? file.pending : null }
 
-          if (!isDone) return { ...settled, failures: file.failures + 1 }
+          // A read that failed (no such file, a refusal) changed nothing: no failure to show
+          if (!isDone) return touch.kind === 'read' ? settled : { ...settled, failures: file.failures + 1 }
           if (isCreated) return { ...settled, isCreated: true }
           if (touch.kind === 'read') return { ...settled, reads: file.reads + 1 }
 
           return { ...settled, edits: file.edits + 1 }
-        }),
-      ),
+        })
+
+        // And where it was all that happened to the file, no row either
+        return { ...settled, files: settled.files.filter(file => file.key !== seed.key || !isBlank(file)) }
+      }),
     )
+    // Its lines added and removed, counted off this path
+    if (isDone && pending === 'edit') countLater($, turnId, seed.key)
     // A new file joins the search's catalogue; the commit view follows a tool's edits too
     if (isCreated) refreshCatalog($, await read($, git))
     if (pending === 'edit' && (await read($, mode)) === 'commit') scheduleScan($)
 
     return ran
-  }).catch(($, e, next) => next(e)) // a slip in the bookkeeping never costs the tool call
+  }).catch((_, e, next) => next(e)) // a slip in the bookkeeping never costs the tool call
 
   // A click in the desktop's list: open the file, fold a folder, reveal a found one
   on('ui.message', async ($, e, next) => {

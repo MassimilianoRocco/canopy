@@ -168,6 +168,38 @@ export const hunksOf = (lines: readonly DiffLine[], context = 3): Hunk[] => {
 }
 
 /**
+ * A hunk cut to the lines that fit in `max` characters, its header counting
+ * what is left, so it still parses as a diff; undefined when no changed line fits.
+ */
+export const clipHunk = (hunk: Hunk, max: number): Hunk | undefined => {
+  const [header = '', ...rows] = hunk.source.split('\n')
+  const match = /^@@ -(\d+),(\d+) \+(\d+),(\d+) @@/.exec(header)
+  if (match === null) return undefined
+  const kept: string[] = []
+  let size = header.length
+  for (const row of rows) {
+    if (size + 1 + row.length > max) break
+    kept.push(row)
+    size += 1 + row.length
+  }
+  if (!kept.some(row => row.startsWith('+') || row.startsWith('-'))) return undefined
+
+  const oldCount = kept.filter(row => !row.startsWith('+')).length
+  const newCount = kept.filter(row => !row.startsWith('-')).length
+  // A side left with no lines names the line before the hunk, as diff does
+  const startOf = (start: string, count: string, left: number) => Number(start) - (Number(count) > 0 && left === 0 ? 1 : 0)
+  const newStart = startOf(match[3]!, match[4]!, newCount)
+  const from = Math.max(1, newStart)
+
+  return {
+    source: [`@@ -${startOf(match[1]!, match[2]!, oldCount)},${oldCount} +${newStart},${newCount} @@`, ...kept].join('\n'),
+    from,
+    to: Math.max(from, newStart + newCount - 1),
+    at: hunk.at,
+  }
+}
+
+/**
  * Only the changes, each with `context` kept lines around it: unified-diff
  * hunks numbered as in the two files. Empty when nothing changed.
  */

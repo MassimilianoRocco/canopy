@@ -1,6 +1,6 @@
 import { expect, test } from 'claude-code/testing'
 
-import { changesOf, diffLines, hunksSource, linesOf } from '../hooks/diff'
+import { changesOf, clipHunk, diffLines, hunksOf, hunksSource, linesOf } from '../hooks/diff'
 
 const sides = (before: string[], after: string[]) => {
   const lines = diffLines(before, after)
@@ -65,4 +65,26 @@ test('only the changes: hunks with three lines of context, numbered as in each f
 test('a hunk with no old lines names the line before it, and no change makes none', () => {
   expect(hunksSource(diffLines([], ['a', 'b']))).toBe('@@ -0,0 +1,2 @@\n+a\n+b')
   expect(hunksSource(diffLines(['x'], ['x']))).toBe('')
+})
+
+test('a hunk cut to the room keeps a header that counts what is left', () => {
+  const before = Array.from({ length: 10 }, (_, at) => `l${at + 1}`)
+  const [hunk] = hunksOf(diffLines(before, before.map(line => line.toUpperCase())))
+  const cut = clipHunk(hunk!, 40)!
+  const [header, ...rows] = cut.source.split('\n')
+  const [, oldCount, newCount] = /^@@ -\d+,(\d+) \+\d+,(\d+) @@$/.exec(header!) ?? []
+
+  expect(cut.source.length).toBeLessThanOrEqual(40)
+  expect(hunk!.source.split('\n').slice(1, rows.length + 1)).toEqual(rows)
+  expect(Number(oldCount)).toBe(rows.filter(row => !row.startsWith('+')).length)
+  expect(Number(newCount)).toBe(rows.filter(row => !row.startsWith('-')).length)
+  expect(cut.at).toBe(hunk!.at)
+})
+
+test('a side a cut leaves empty names the line before, and no room for a change cuts nothing', () => {
+  // Lines added before the first: cut to the additions, the old side is empty
+  const [hunk] = hunksOf(diffLines(['x'], ['a', 'b', 'c', 'd', 'x']))
+  expect(hunk!.source.split('\n')[0]).toBe('@@ -1,1 +1,5 @@')
+  expect(clipHunk(hunk!, 26)?.source).toBe('@@ -0,0 +1,3 @@\n+a\n+b\n+c')
+  expect(clipHunk(hunk!, 10)).toBeUndefined()
 })

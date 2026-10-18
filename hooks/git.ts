@@ -29,22 +29,36 @@ type Files = {
   read: (path: string) => Promise<string>
 }
 
+// A file holding a NUL byte is binary: its text would diff and count as noise
 export async function textOf($: { fs: Files }, path: string): Promise<FileText> {
   const isThere = await $.fs.exists(path).catch(() => false)
   if (!isThere) return { kind: 'missing' }
   const text = await $.fs.read(path).catch(() => undefined)
-  if (text === undefined || text.length > MAX_TEXT) return { kind: 'too-large' }
+  if (text === undefined || text.length > MAX_TEXT || text.includes('\0')) return { kind: 'too-large' }
 
   return { kind: 'text', text }
+}
+
+type Session = {
+  root: () => Promise<string>
+  cwd: () => Promise<string>
+}
+
+// The project's folder, the tree's root: a shell `cd` moves the cwd, never this
+export function rootOf($: { session: Session }) {
+  return $.session.root().catch(() => $.session.cwd()).catch(() => '')
 }
 
 // Kept once found; null (outside a repository, or no `$.process` here) is asked again
 let repoTop: string | undefined
 
-export async function topOf($: { process: Process }): Promise<string | null> {
+// Asked from the project's folder: from the session's cwd, which a shell `cd`
+// moves, it could name another repository and keep it
+export async function topOf($: { process: Process; session: Session }): Promise<string | null> {
   if (repoTop !== undefined) return repoTop
+  const base = await rootOf($)
   const out = await $.process
-    .run(['git', 'rev-parse', '--show-toplevel'], { timeoutMs: 5000 })
+    .run(['git', 'rev-parse', '--show-toplevel'], { ...(base === '' ? {} : { cwd: base }), timeoutMs: 5000 })
     .catch(() => undefined)
   const top = out?.exitCode === 0 ? out.stdout.trim().replace(/\/+$/, '') : ''
   if (top === '') return null
@@ -70,8 +84,12 @@ function git($: { process: Process }, top: string, args: readonly string[]) {
   return $.process.run(['git', '--no-optional-locks', ...args], { cwd: top, timeoutMs: 10_000 }).catch(() => undefined)
 }
 
-/** One `git status`; null outside a repository or where git can't run. */
-export async function readGit($: EngineInterface): Promise<GitStatus | null> {
+/**
+ * One `git status`; null outside a repository or where git can't run. With
+ * `withCounts`, each tracked file's lines added and removed since the last
+ * commit too: one `git diff --numstat` more.
+ */
+export async function readGit($: EngineInterface, withCounts = false): Promise<GitStatus | null> {
   const top = await topOf($)
   if (top === null) return null
   const out = await git($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
@@ -84,15 +102,49 @@ export async function readGit($: EngineInterface): Promise<GitStatus | null> {
     const field = fields[at]!
     if (field.length < 4) continue
     const xy = field.slice(0, 2)
-    files.push({ rel: field.slice(3), code: codeOf(xy) })
-    if (/[RC]/.test(xy)) at += 1
+    const from = /[RC]/.test(xy) ? fields[++at] : undefined
+    files.push({ rel: field.slice(3), code: codeOf(xy), ...(from === undefined || from === '' ? {} : { from }) })
+  }
+  const counts = withCounts && files.length > 0 ? await readCounts($, top) : undefined
+
+  return {
+    at: await $.clock.now(),
+    top,
+    files: files.map(file => {
+      const count = counts?.get(file.rel)
+
+      return count === undefined ? file : { ...file, added: count[0], removed: count[1] }
+    }),
+  }
+}
+
+/**
+ * Lines added and removed since the last commit, by repo-relative path (a
+ * rename by its new one): `added\tremoved\tpath\0`, a rename's path empty and
+ * its source and new path after it; a binary file's counts are `-`. Empty
+ * before the first commit, or where git can't say.
+ */
+async function readCounts($: EngineInterface, top: string) {
+  const counts = new Map<string, [number, number]>()
+  const out = await git($, top, ['diff', '--numstat', '-z', '-M', 'HEAD'])
+  if (out === undefined || out.exitCode !== 0 || out.isStdoutTruncated) return counts
+  const fields = out.stdout.split('\0')
+  for (let at = 0; at < fields.length; at++) {
+    const match = /^(\d+|-)\t(\d+|-)\t([\s\S]*)$/.exec(fields[at]!)
+    if (match === null) continue
+    let rel = match[3]!
+    if (rel === '') {
+      rel = fields[at + 2] ?? ''
+      at += 2
+    }
+    if (rel !== '' && match[1] !== '-' && match[2] !== '-') counts.set(rel, [Number(match[1]), Number(match[2])])
   }
 
-  return { at: await $.clock.now(), top, files }
+  return counts
 }
 
 /** The last commit's text of a repo-relative path; missing when git doesn't track it. */
-export async function headText($: { process: Process }, rel: string): Promise<FileText> {
+export async function headText($: { process: Process; session: Session }, rel: string): Promise<FileText> {
   const top = await topOf($)
   if (top === null) return { kind: 'missing' }
   const out = await $.process
