@@ -1,0 +1,38 @@
+{
+  "name": "canopy",
+  "version": "1.0.0",
+  "description": "A live project tree beside the conversation: the files Claude reads and changes, turn by turn, with each turn's diff",
+  "author": { "name": "Massimiliano Rocco" },
+  "license": "MIT",
+  "keywords": ["files", "diff", "tree", "turns", "intellij", "vscode"],
+  "types": "./types/index.d.ts",
+  "userConfig": {
+    "language": {
+      "type": "string",
+      "title": "Language",
+      "description": "The pane's language: auto follows the system's",
+      "default": "auto",
+      "options": ["auto", "en", "it"]
+    },
+    "turns": {
+      "type": "string",
+      "title": "Turns kept",
+      "description": "How many of the last turns the pane can go back to",
+      "default": "10",
+      "options": ["5", "10", "20"]
+    },
+    "editor": {
+      "type": "string",
+      "title": "Editor",
+      "description": "Where Open and Compare send a file: auto picks IntelliJ, then VS Code",
+      "default": "auto",
+      "options": ["auto", "intellij", "vscode", "off"]
+    },
+    "editorPath": {
+      "type": "string",
+      "title": "Editor launcher",
+      "description": "The editor's launcher (idea64.exe, idea, code), when Canopy does not find it by itself",
+      "default": ""
+    }
+  }
+}

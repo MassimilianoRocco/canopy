@@ -1,0 +1,8 @@
+# Written by Claude Code when it loads the plugin: its own API's types
+.claude-plugin/types/
+
+# Operating system and editor leftovers
+.DS_Store
+Thumbs.db
+*.log
+.mcpb-cache/

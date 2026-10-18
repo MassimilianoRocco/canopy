@@ -1,0 +1,6 @@
+{
+  "name": "canopy",
+  "owner": { "name": "Massimiliano Rocco" },
+  "description": "Canopy, a project tree for Claude Code that shows what each turn read and changed",
+  "plugins": [{ "name": "canopy", "source": "./" }]
+}
