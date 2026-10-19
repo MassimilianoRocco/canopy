@@ -179,7 +179,20 @@ export const indexOf = (base: string) => (index !== undefined && index.base === 
 
 const splitZ = (out: string) => out.split('\0').filter(part => part !== '')
 
-type Found = { top: string; ignored: string[]; count: number; isCut: boolean }
+/** What a listing found; `isSameIndex` when the search's files are those it held already. */
+type Found = { top: string; ignored: string[]; count: number; isCut: boolean; isSameIndex: boolean }
+
+// Puts `files` in the index, and says whether they were there already
+const setIndex = (base: string, files: string[]) => {
+  const isSame =
+    index !== undefined &&
+    index.base === base &&
+    index.files.length === files.length &&
+    index.files.every((one, at) => one === files[at])
+  index = { base, files }
+
+  return isSame
+}
 
 /**
  * Lists the files under `base` and what git ignores: two `git ls-files`, or
@@ -204,13 +217,19 @@ export async function readCatalog($: EngineInterface, base: string, status: GitS
         if (prefix === undefined) continue
         if (prefix === '' || rel.toLowerCase().startsWith(prefix.toLowerCase())) files.push(rel.slice(prefix.length))
       }
-      index = { base, files }
+      const isSameIndex = setIndex(base, files)
       const ignored =
         ignoredOut !== undefined && ignoredOut.exitCode === 0
           ? splitZ(ignoredOut.stdout).slice(0, MAX_IGNORED).map(rel => rel.toLowerCase())
           : []
 
-      return { top, ignored, count: files.length, isCut: listed.isStdoutTruncated || files.length >= MAX_INDEX }
+      return {
+        top,
+        ignored,
+        count: files.length,
+        isCut: listed.isStdoutTruncated || files.length >= MAX_INDEX,
+        isSameIndex,
+      }
     }
   }
 
@@ -230,7 +249,7 @@ export async function readCatalog($: EngineInterface, base: string, status: GitS
       }
     }
   }
-  index = { base, files }
+  const isSameIndex = setIndex(base, files)
 
-  return { top: '', ignored: [], count: files.length, isCut: files.length >= MAX_WALK }
+  return { top: '', ignored: [], count: files.length, isCut: files.length >= MAX_WALK, isSameIndex }
 }

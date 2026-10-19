@@ -6,12 +6,11 @@ export type TouchedFile = {
   path: string
   /** The path as shown: relative to the project when under it. */
   label: string
-  reads: number
   edits: number
   isCreated: boolean
-  /** Calls on the file still running, and the kind of the last one started. */
+  /** Edits of the file still running; `edit` while one is. */
   running: number
-  pending: 'read' | 'edit' | null
+  pending: 'edit' | null
   failures: number
   /**
    * Changed with no file tool, seen through git: while one of Claude's shell
@@ -34,7 +33,6 @@ export type TurnRecord = {
   durationMs: number | null
   endReason: 'answer' | 'aborted' | 'refusal' | 'error' | null
   files: TouchedFile[]
-  searches: number
   commands: number
   /** When each of its shell commands ran, from start to return. */
   runs: [number, number][]

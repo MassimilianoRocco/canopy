@@ -4,6 +4,7 @@ import type { EngineInterface, Timer } from 'claude-code'
 import type { FileText, GitFile, GitStatus, Snapshot, TouchedFile, TurnRecord } from '../types'
 import { changesOf, diffLines, linesOf } from './diff'
 import { clearHeads, headText, readCatalog, readGit, rootOf, textOf } from './git'
+import { forgetListings } from './listing'
 import { hasDiff, isClaude, withFile } from './model'
 import { keyOf, labelOf } from './paths'
 
@@ -23,6 +24,32 @@ const RUN_TAIL = 2000
 
 async function baseOf($: EngineInterface) {
   return (await read($, root)) || (await rootOf($))
+}
+
+// ---- What the kept texts weigh ----
+// Each changed file's text as a turn found it and as it left it, for its
+// diff: a megabyte each at most, for every turn kept. Past these sizes, in
+// characters, a text is kept as too large to show, its row listed all the same
+
+const MAX_TURN_TEXT = 6_000_000
+const MAX_KEPT_TEXT = 24_000_000
+const weights = new Map<string, number>()
+
+/** `text` as turn `turnId` keeps it: whole while the turn, and all the turns, have room for it. */
+export function keepText(turnId: string, text: FileText): FileText {
+  if (text.kind !== 'text') return text
+  const turn = weights.get(turnId) ?? 0
+  let all = 0
+  for (const one of weights.values()) all += one
+  if (turn + text.text.length > MAX_TURN_TEXT || all + text.text.length > MAX_KEPT_TEXT) return { kind: 'too-large' }
+  weights.set(turnId, turn + text.text.length)
+
+  return text
+}
+
+/** Gives back the room these turns' texts took: they left the history. */
+export const releaseTexts = (turnIds: readonly string[]) => {
+  for (const id of turnIds) weights.delete(id)
 }
 
 // ---- What a turn found as it began ----
@@ -45,7 +72,7 @@ const starts = new Map<string, Start | 'pending'>()
 async function readStart($: EngineInterface): Promise<Start> {
   // It replaces the status the commit view draws: with its counts there
   const status = await readGit($, (await read($, mode)) === 'commit')
-  await update($, git, () => status)
+  await keepStatus($, status)
   if (status === null) return null
 
   const dirty = new Set(status.files.filter(file => file.code !== 'D').map(file => file.rel))
@@ -113,8 +140,8 @@ const isByCommand = (turn: TurnRecord, mtime: number, now: number) =>
  * `outside` otherwise. Keeps what each was as the turn began, and once the
  * turn has ended, what it left.
  */
-async function markScanned($: EngineInterface, status: GitStatus) {
-  const turn = (await read($, history)).at(-1)
+async function markScanned($: EngineInterface, status: GitStatus, turnId: string) {
+  const turn = (await read($, history)).find(one => one.id === turnId)
   if (turn === undefined || turn.id === 'orphan') return
   const known = new Map(turn.files.map(file => [file.key, file]))
   const now = await $.clock.now()
@@ -140,8 +167,9 @@ async function markScanned($: EngineInterface, status: GitStatus) {
     const found = await startOf($, turn.id, file)
     if (found === undefined) continue
     if (found.isNew) created.add(keyOf(path))
+    const before = keepText(turn.id, found.before)
     await update($, snapshot, (current): Snapshot =>
-      current.before === undefined ? { ...current, before: found.before, base: found.base } : current,
+      current.before === undefined ? { ...current, before, base: found.base } : current,
     )
   }
   if (fresh.length > 0) {
@@ -163,14 +191,20 @@ async function markScanned($: EngineInterface, status: GitStatus) {
     )
   }
 
-  const ended = (await read($, history)).find(one => one.id === turn.id)
+  const turns = await read($, history)
+  const ended = turns.find(one => one.id === turn.id)
   if (ended === undefined) return
   const changed = ended.files.filter(one => one.via !== undefined && hasDiff(one))
+  // A turn begun while this scan ran (see settleScan) may have changed a file already
+  const later = turns.at(-1)?.id === ended.id ? undefined : turns.at(-1)
   if (ended.durationMs !== null) {
     for (const file of changed) {
       const snapshot = atom({ ...SNAPSHOT, id: `${ended.id}|${file.key}` }, {})
       if ((await read($, snapshot)).after === undefined) {
-        const after = await textOf($, file.path)
+        // What the later turn found is what this one left; else the file now
+        const found =
+          later === undefined ? undefined : (await read($, atom({ ...SNAPSHOT, id: `${later.id}|${file.key}` }, {}))).before
+        const after = keepText(ended.id, found ?? (await textOf($, file.path)))
         await update($, snapshot, current => ({ ...current, after }))
       }
     }
@@ -223,16 +257,24 @@ async function countDue($: EngineInterface) {
       const id = `${turnId}|${file.key}`
       const snapshot = await read($, atom({ ...SNAPSHOT, id }, {}))
       const before = snapshot.before
+      // Nothing to count against: the file isn't read at all
+      if (before === undefined || before.kind === 'too-large') continue
       // As the file view draws it: the text the turn left, else the file now
       const isLeft = snapshot.after !== undefined && turn.durationMs !== null
       const stat = isLeft ? undefined : await $.fs.stat(file.path).catch(() => undefined)
-      const from = `${before === undefined ? '' : before.kind}|${isLeft ? 'left' : `${stat?.mtimeMs ?? -1}:${stat?.size ?? -1}`}`
-      if (keys.get(file.key) === false && file.added !== undefined && countedFrom.get(id) === from) continue
+      const from = `${before.kind}|${isLeft ? 'left' : `${stat?.mtimeMs ?? -1}:${stat?.size ?? -1}`}`
+      // Left as it was counted, or as it was found to be no text: not read again
+      const last = countedFrom.get(id)
+      const isSettled = last === `${from}|none` || (last === from && file.added !== undefined)
+      if (keys.get(file.key) === false && isSettled) continue
       const after = isLeft ? snapshot.after! : await textOf($, file.path)
-      if (before === undefined || before.kind === 'too-large' || after.kind === 'too-large') continue
+      if (countedFrom.size >= MAX_COUNTED) countedFrom.clear()
+      if (after.kind === 'too-large') {
+        countedFrom.set(id, `${from}|none`)
+        continue
+      }
       const { added, removed } = changesOf(diffLines(linesOf(textOr(before)), linesOf(textOr(after))))
       counted.set(file.key, { added, removed })
-      if (countedFrom.size >= MAX_COUNTED) countedFrom.clear()
       countedFrom.set(id, from)
     }
     if (counted.size === 0) continue
@@ -250,15 +292,28 @@ async function countDue($: EngineInterface) {
 
 let isCataloguing = false
 
-/** Lists the project again, off every path; a list already under way is not doubled. */
+const isSameList = (a: readonly string[], b: readonly string[]) =>
+  a.length === b.length && a.every((one, at) => one === b[at])
+
+/** Lists the project again, off every path; a list already under way is not doubled (false). */
 export function refreshCatalog($: EngineInterface, status: GitStatus | null) {
-  if (isCataloguing) return
+  if (isCataloguing) return false
   isCataloguing = true
   $.clock.after(0, () => {
     void (async () => {
       const base = await baseOf($)
       if (base === '') return
-      const found = await readCatalog($, base, status)
+      const { isSameIndex, ...found } = await readCatalog($, base, status)
+      // The same list: nothing to draw again
+      const was = await read($, catalog)
+      const isSame =
+        isSameIndex &&
+        was !== null &&
+        was.top === found.top &&
+        was.count === found.count &&
+        was.isCut === found.isCut &&
+        isSameList(was.ignored, found.ignored)
+      if (isSame) return
       const at = await $.clock.now()
       await update($, catalog, () => ({ at, ...found }))
     })()
@@ -267,6 +322,8 @@ export function refreshCatalog($: EngineInterface, status: GitStatus | null) {
         isCataloguing = false
       })
   })
+
+  return true
 }
 
 // ---- Work kept off the tool path ----
@@ -284,6 +341,29 @@ export const isScanning = () => scanTimer !== undefined || scanJob !== undefined
 
 export const hasScanned = () => hasAnswered
 
+/** The same files in the same states: a status that redraws nothing. */
+const isSameStatus = (a: GitStatus | null, b: GitStatus | null) =>
+  a === null || b === null ? a === b : a.top === b.top && JSON.stringify(a.files) === JSON.stringify(b.files)
+
+/** Keeps `status` as git's last answer, unless it says what the one kept says. */
+async function keepStatus($: EngineInterface, status: GitStatus | null) {
+  if (!isSameStatus(await read($, git), status)) await update($, git, () => status)
+}
+
+// What the catalogue follows in a status: the files that came, went or moved,
+// not the ones only modified. A scan after each burst of commands lists the
+// project again only when they changed, or when the list is this old (an
+// ignore rule edited, a folder made that git ignores)
+const CATALOG_STALE = 60_000
+let catalogued: { shape: string; at: number } | undefined
+// The shape the last scan found: a new one means files came or went, and the tree lists its folders again
+let lastShape: string | undefined
+
+const shapeOf = (status: GitStatus | null) =>
+  status === null
+    ? ''
+    : [status.top, ...status.files.filter(file => file.code !== 'M').map(file => `${file.code}${file.rel}`)].join('\0')
+
 /**
  * Asks git again and marks what it found. The counts since the last commit
  * only where they are drawn, and never on the prompt's path (`withCounts`
@@ -291,33 +371,60 @@ export const hasScanned = () => hasAnswered
  */
 export async function runScan($: EngineInterface, withCounts?: boolean) {
   clearHeads()
+  // The turn it marks, taken before git is asked: a new one may begin while it runs
+  const turnId = (await read($, history)).at(-1)?.id
   const status = await readGit($, withCounts ?? (await read($, mode)) === 'commit')
   hasAnswered = true
-  await update($, git, () => status)
-  if (status !== null) await markScanned($, status)
-  refreshCatalog($, status)
+  await keepStatus($, status)
+  if (status !== null && turnId !== undefined) await markScanned($, status, turnId)
+  const shape = shapeOf(status)
+  if (lastShape !== undefined && lastShape !== shape) forgetListings()
+  lastShape = shape
+  const now = await $.clock.now()
+  const isDue = catalogued === undefined || catalogued.shape !== shape || now - catalogued.at >= CATALOG_STALE
+  // A list already under way may predate this status: the next scan asks again
+  if (isDue && refreshCatalog($, status)) catalogued = { shape, at: now }
+}
+
+function startScan($: EngineInterface, withCounts?: boolean) {
+  const job = runScan($, withCounts).catch(() => undefined)
+  scanJob = job
+  void job.then(() => {
+    if (scanJob === job) scanJob = undefined
+  })
+
+  return job
 }
 
 export function scheduleScan($: EngineInterface, ms = SCAN_DELAY) {
   scanTimer?.cancel()
   scanTimer = $.clock.after(ms, () => {
     scanTimer = undefined
-    const job = runScan($).catch(() => undefined)
-    scanJob = job
-    void job.then(() => {
-      if (scanJob === job) scanJob = undefined
-    })
+    startScan($)
   })
 }
 
+// How long a new turn waits for a scan under way. A command that rewrote
+// hundreds of files is a scan of seconds: past this it goes on beside the new
+// turn, marking the turn it began for, and the prompt is never held for it
+const SETTLE_MAX = 2000
+
+/** Lets a scan pending or under way mark the last turn before a new one begins, within SETTLE_MAX. */
 export async function settleScan($: EngineInterface) {
   if (scanTimer !== undefined) {
     scanTimer.cancel()
     scanTimer = undefined
     // The turn's attribution needs the status alone; the counts follow off the path
-    await runScan($, false).catch(() => undefined)
+    startScan($, false)
   }
-  await scanJob
+  const job = scanJob
+  if (job === undefined) return
+  const done = new AbortController()
+  await Promise.race([
+    job.then(() => done.abort()),
+    $.clock.sleep(SETTLE_MAX, { signal: done.signal }).catch(() => undefined),
+  ])
+  done.abort()
 }
 
 export const stopScans = () => {

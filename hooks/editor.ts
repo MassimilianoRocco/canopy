@@ -259,8 +259,10 @@ export function compareIn($: EngineInterface, editor: Editor, left: string, righ
 
 /**
  * Writes one side of a comparison to the temporary folder, named after the
- * file and the moment it stands for (`login (before turn 5).ts`), so the
+ * file and the side it stands for (`login (before the turn).ts`), so the
  * editor's diff says what it compares and highlights it as the file's type.
+ * One name per side, written over at each comparison: nothing can delete
+ * here, and the folder holds three files at most for each file compared.
  */
 export async function writeSide($: EngineInterface, key: string, label: string, moment: string, text: string) {
   const temp = (await $.env.get('TEMP')) ?? (await $.env.get('TMPDIR')) ?? '/tmp'

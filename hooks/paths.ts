@@ -8,6 +8,9 @@ export const keyOf = (path: string) => slashes(path).toLowerCase().replace(/(.)\
 export const joinPath = (dir: string, name: string) =>
   /[\\/]$/.test(dir) ? dir + name : dir + (dir.includes('\\') ? '\\' : '/') + name
 
+/** A path under `base` from its forward-slashed relative one, in `base`'s own slashes. */
+export const pathIn = (base: string, rel: string) => joinPath(base, rel.replace(/\//g, base.includes('\\') ? '\\' : '/'))
+
 /** A path relative to `base` when under it, else whole, with forward slashes. */
 export const labelOf = (path: string, base: string) => {
   const file = slashes(path)

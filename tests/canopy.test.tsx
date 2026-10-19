@@ -19,6 +19,10 @@ const PANE = {
   },
 } as const
 
+// The kit runs the tests with timers, which the plugin's own environment has none of: for a
+// wait in real time, as the tree's listings keep it
+declare const setTimeout: (done: () => void, ms: number) => unknown
+
 const SURFACES = ['terminal', 'desktop'] as const
 type Surface = (typeof SURFACES)[number]
 
@@ -28,8 +32,15 @@ const IT = { options: { language: 'it' } }
 // What `git` answers: the committed text by repo-relative path, and what it
 // ignores (a folder ends in `/`). Absent, the project is no repository.
 // `renamed` maps a staged rename's new path to its old one; `nested` is a
-// folder inside the project holding a repository of its own.
-type Repo = { head: Record<string, string>; ignored?: string[]; renamed?: Record<string, string>; nested?: string }
+// folder inside the project holding a repository of its own; `showDelay`, how
+// long each `git show` takes on the test's clock.
+type Repo = {
+  head: Record<string, string>
+  ignored?: string[]
+  renamed?: Record<string, string>
+  nested?: string
+  showDelay?: number
+}
 
 const ran = (exitCode: number, stdout = '') => ({
   value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
@@ -52,6 +63,8 @@ const project = (
   const lists = { count: 0 }
   const reads = { count: 0 }
   const processes = { count: 0 }
+  // How many times the project's files were listed for the search
+  const catalogs = { count: 0 }
   // An Edit on a held path waits: `isReached` once it is under way, `release` lets it end
   const gates = new Map<string, { reached: () => void; open: Promise<void> }>()
   const hold = (path: string) => {
@@ -76,9 +89,12 @@ const project = (
   const isIgnored = (rel: string) => (repo?.ignored ?? []).some(one => rel === one || (one.endsWith('/') && rel.startsWith(one)))
 
   const clock = mock.clock(on, { now: 1_000_000 })
+  // Each write at a moment of its own, as a disk's clock is finer than the test's
+  let writes = 0
   const touch = (path: string, text: string) => {
     disk.set(path, text)
-    writtenAt.set(path, clock.now())
+    writes += 1
+    writtenAt.set(path, clock.now() + writes / 1000)
   }
   on('session.cwd', () => ({ value: cwd }))
   on('session.root', () => ({ value: 'C:\\proj' }))
@@ -96,7 +112,7 @@ const project = (
     if (!disk.has(path)) return { deny: 'ENOENT' }
 
     return {
-      value: { kind: 'file', size: 0, mtimeMs: writtenAt.get(path) ?? 0, isLink: false },
+      value: { kind: 'file', size: disk.get(path)!.length, mtimeMs: writtenAt.get(path) ?? 0, isLink: false },
     }
   })
   on('fs.write', (_, e) => {
@@ -104,7 +120,7 @@ const project = (
 
     return { value: undefined }
   })
-  on('process.run', (_, e) => {
+  on('process.run', async (_, e) => {
     processes.count += 1
     const [command, ...rest] = e.argv
     // An editor started detached: recorded, and it starts
@@ -164,11 +180,13 @@ const project = (
     }
     if (verb === 'ls-files') {
       if (rest.includes('--ignored')) return ran(0, (repo.ignored ?? []).map(rel => `${rel}\0`).join(''))
+      catalogs.count += 1
       const listed = inProject.map(relOf).filter(rel => !isIgnored(rel))
 
       return ran(0, listed.map(rel => `${rel}\0`).join(''))
     }
     const committed = repo.head[String(target).replace(/^HEAD:/, '')]
+    if (verb === 'show' && repo.showDelay !== undefined) await clock.sleep(repo.showDelay)
     if (verb === 'show' && committed !== undefined) return ran(0, committed)
 
     return ran(128)
@@ -202,13 +220,13 @@ const project = (
       }
       const text = disk.get(e.file_path)
       if (text === undefined) return { deny: 'no such file' }
-      disk.set(e.file_path, text.replace(e.old_string, e.new_string))
+      touch(e.file_path, text.replace(e.old_string, e.new_string))
 
       return { result: 'ok' }
     }
     if (e.tool === 'Write') {
       const type = disk.has(e.file_path) ? 'update' : 'create'
-      disk.set(e.file_path, e.content)
+      touch(e.file_path, e.content)
 
       return { result: { type } }
     }
@@ -226,7 +244,7 @@ const project = (
     return { result: 'ok' }
   })
 
-  return { clock, scans, lists, reads, processes, hold, touch, launched, saved }
+  return { clock, scans, lists, reads, processes, catalogs, hold, touch, launched, saved }
 }
 
 // How an editor starts on Windows: Start-Process, the launcher and its arguments in variables
@@ -306,7 +324,6 @@ test('the tree colours the files a turn changed and opens a folder that holds on
     expect(await ui.find({ type: 'Text', text: '2 file' })).toBeDefined()
     expect((await ui.find({ type: 'Text', text: '+2' }))?.props.color).toBe('success')
     expect((await ui.find({ type: 'Text', text: '−1' }))?.props.color).toBe('error')
-    expect(await ui.find({ type: 'Text', text: '· 1 letto' })).toBeDefined()
     expect(await list.row(/Modifiche/)).toBeDefined()
     // A new file says so in words, beside its folder
     expect(await list.row(/src · nuovo/)).toBeDefined()
@@ -349,7 +366,7 @@ test('a desktop draws its lists in a Client: coloured names, counts, quiet chrom
   expect(await ui.find({ key: 'file:c:/proj/src/login.ts' })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: '●' }))?.props.color).toBe('warning')
   // The guide and the chevron quiet, the lines added and removed at the row's end
-  expect((await ui.find({ type: 'Text', text: /^│ $/, in: 'tree' }))?.props.color).toBe('subtle')
+  expect((await ui.find({ type: 'Text', text: /^│ {3}$/, in: 'tree' }))?.props.color).toBe('subtle')
   expect((await ui.find({ type: 'Text', text: /^▾ $/, in: 'tree' }))?.props.color).toBe('subtle')
   expect((await ui.find({ type: 'Text', text: /^ \+1$/, in: 'tree' }))?.props.color).toBe('success')
   expect((await ui.find({ type: 'Text', text: /^ −1$/, in: 'tree' }))?.props.color).toBe('error')
@@ -452,7 +469,7 @@ test('the row under the pointer lights, and only an active one', IT, async ($, o
   // The space between the sections is no target: nothing lights there
   await ui.pointer({ type: 'move', x: 3, y: 2, in: 'tree' })
   expect((await rowBoxes()).some(box => box.props.backgroundColor !== undefined)).toBe(false)
-  expect((await name())?.props.underline).toBe(false)
+  expect((await name())?.props.underline).toBeUndefined()
 
   await ui.pointer({ type: 'move', x: 3, y: 1, in: 'tree' })
   await ui.pointer({ type: 'leave', x: 3, y: 1, in: 'tree' })
@@ -622,28 +639,41 @@ test('a refused edit is red, an unchanged file opens plain, and a subagent adds 
     const code = await ui.find({ type: 'Code' })
     expect(code?.props.format).toBeUndefined()
     expect(code?.props.source).toBe('uno')
-    expect(await ui.find({ type: 'Text', text: /letto · non modificato in questo turno/ })).toBeDefined()
+    expect(await ui.find({ type: 'Text', text: 'non modificato in questo turno' })).toBeDefined()
     await ui.press({ key: 'back' })
     await ui.unmount()
   }
 })
 
-test('a read that fails marks nothing: no row, no failure', IT, async ($, on) => {
-  project(on, { 'C:\\proj\\a.ts': 'uno\n' })
+test('what Claude only reads or searches leaves no trace, and draws nothing again', IT, async ($, on) => {
+  project(on, { 'C:\\proj\\docs\\notes.md': 'x\n', 'C:\\proj\\a.ts': 'x\n' })
+  // The turns as written: a read or a search writes nothing, so nothing is drawn again
+  let written = 0
+  on('state.set', { plugin: 'canopy', key: 'history' }, (_, e, next) => {
+    written += 1
 
-  await $.turn.start({ text: 'cerca la configurazione', turnId: 't1' })
+    return next(e)
+  })
+
+  await $.turn.start({ text: 'leggi', turnId: 't1' })
+  const before = written
+  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\docs\\notes.md' })
+  // One that fails, too: no file there
   await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\config\\local.json' })
-  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\a.ts' })
-  await $.turn.complete(done('t1'))
+  await $.tool.call({ tool: 'Grep', pattern: 'x' })
+  await $.tool.call({ tool: 'Glob', pattern: '*.ts' })
+  expect(written).toBe(before)
 
   for (const surface of SURFACES) {
     const ui = await $.ui.mount({ ...PANE, surface })
     const list = listOf(ui, surface)
-    expect(await list.row(/non riuscit/)).toBeUndefined()
-    expect(await list.row(/^ ?!$/)).toBeUndefined()
-    expect(await list.row(/Modifiche/)).toBeUndefined()
+    // No folder opened for a read, no word, no count, no failure
+    expect(await list.row(/▸ docs/)).toBeDefined()
+    expect(await list.row(/notes\.md/)).toBeUndefined()
     expect(await list.row(/local\.json/)).toBeUndefined()
-    expect(await ui.find({ type: 'Text', text: '1 letto' })).toBeDefined()
+    expect(await list.row(/^ ?!$/)).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: /lett[oi]/ })).toBeUndefined()
+    expect(await ui.find({ type: 'Text', text: 'Nessun file modificato in questo turno.' })).toBeDefined()
     await ui.unmount()
   }
 })
@@ -732,7 +762,7 @@ test('outside a git repository a shell command marks nothing', IT, async ($, on)
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '1 comando' })).toBeDefined()
-  expect(await ui.find({ type: 'Text', text: 'Nessun file toccato in questo turno.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Nessun file modificato in questo turno.' })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /a\.ts/, in: 'tree' }))?.props.color).toBeUndefined()
   await ui.unmount()
 })
@@ -1060,7 +1090,7 @@ test('IntelliJ, found by itself, opens the file at its change and diffs the turn
 
   // The turn's own diff: the file as the turn found it, beside the file now
   await ui.press({ key: 'editor:compare' })
-  const left = [...saved.keys()].find(path => path.endsWith('login (prima del turno 1).ts'))
+  const left = [...saved.keys()].find(path => path.endsWith('login (prima del turno).ts'))
   expect(left?.startsWith('C:\\Temp\\canopy\\')).toBe(true)
   expect(saved.get(left!)).toBe(before)
   expect(launched.at(-1)).toEqual(started(idea, `"diff" "${left}" "C:\\proj\\src\\login.ts"`))
@@ -1243,7 +1273,7 @@ test('a call that ends after a new turn began stays with the turn it began in', 
   await call
 
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
-  expect(await ui.find({ type: 'Text', text: 'Nessun file toccato in questo turno.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'Nessun file modificato in questo turno.' })).toBeDefined()
   await ui.press({ key: 'prev' })
   expect(await ui.find({ type: 'Text', text: 'Turno 1' })).toBeDefined()
   expect((await ui.find({ type: 'Text', text: /^a\.ts$/ }))?.props.color).toBe('suggestion')
@@ -1451,12 +1481,12 @@ test('on a desktop the room before a name is monospaced, so the names start in o
   const texts = await ui.findAll({ type: 'Text', in: 'tree' })
   const one = (pattern: RegExp) => texts.find(text => pattern.test(text.text))
   // A guide, a chevron, a section's indent, a file's lead and its badge: one width each, whatever the letters
-  expect(one(/^│ $/)?.props.mono).toBe(true)
+  expect(one(/^│ {3}$/)?.props.mono).toBe(true)
   expect(one(/^▾ $/)?.props.mono).toBe(true)
   expect(texts.filter(text => text.text === '  ').every(text => text.props.mono === true)).toBe(true)
-  // A badge's letters are monospaced, between two small spaces: the same width for every badge
-  expect(texts.find(text => text.text === 'LI')?.props.mono).toBe(true)
-  expect(texts.find(text => text.text === 'TS')?.props.mono).toBe(true)
+  // A badge is monospaced, its letters between two small spaces: the same width for every badge
+  expect(texts.find(text => text.text === ' LI ')?.props.mono).toBe(true)
+  expect(texts.find(text => text.text === ' TS ')?.props.mono).toBe(true)
   // A file with no badge keeps the same room, blank: two monospaced cells between the same spaces
   const blank = texts.find(text => text.text === '    ' && text.props.size === 'caption')
   expect(blank).toBeDefined()
@@ -1517,6 +1547,417 @@ test('a turn that only wrote outside the project still says what it did', IT, as
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   expect(await ui.find({ type: 'Text', text: '1 fuori dal progetto' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /^\d+ file$/ })).toBeUndefined()
-  expect(await ui.find({ type: 'Text', text: 'Nessun file toccato in questo turno.' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'Nessun file modificato in questo turno.' })).toBeUndefined()
+  await ui.unmount()
+})
+
+// ---- Bounds and steadiness ----
+
+test('a long list on a desktop draws the rows around the pane’s window, and scrolls whole', IT, async ($, on) => {
+  const files: Record<string, string> = {}
+  for (let n = 0; n < 290; n++) files[`C:\\proj\\file-${String(n).padStart(3, '0')}.component.ts`] = 'x\n'
+  for (let n = 0; n < 290; n++) files[`C:\\proj\\src\\part-${String(n).padStart(3, '0')}.service.ts`] = 'x\n'
+  const { clock } = project(on, files)
+  await $.turn.start({ text: 'tutto', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\src\\part-000.service.ts', old_string: 'x', new_string: 'y' })
+  await clock.advance(300)
+
+  // Some 580 rows: far past what one drawing of the list holds
+  const top = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const rows = await rowsOf(top)
+  expect(rows.length).toBeGreaterThan(580)
+  // At the top: the first rows drawn, the rest blank room of their height, so the list is as tall as it is
+  const drawnAt = async (ui: typeof top) => (await ui.findAll({ type: 'Box', in: 'tree' })).filter(box => /^\d+$/.test(box.key ?? ''))
+  const atTop = await drawnAt(top)
+  expect(atTop[0]?.key).toBe('0')
+  expect(atTop.length).toBeGreaterThan(150)
+  expect(await top.find({ type: 'Box', key: 'above', in: 'tree' })).toBeUndefined()
+  expect((await top.find({ type: 'Box', key: 'below', in: 'tree' }))?.props.height).toBe(rows.length - atTop.length)
+  // Nothing was cut: no note
+  expect(await top.find({ type: 'Text', text: /elenco troncato/, in: 'tree' })).toBeUndefined()
+  expect(await top.find({ type: 'Text', text: /elenco troncato/ })).toBeUndefined()
+  await top.unmount()
+
+  // Scrolled 400 rows down: drawn from a little above the window, the rows before it blank room
+  const far = await $.ui.mount({ ...PANE, props: { ...PANE.props, scroll: { offset: 400, bodyRows: 40 } }, surface: 'desktop' })
+  expect((await far.find({ type: 'Box', key: 'above', in: 'tree' }))?.props.height).toBe(360)
+  const there = await drawnAt(far)
+  expect(there[0]?.key).toBe('360')
+  expect(Number(there.at(-1)?.key)).toBeGreaterThan(440)
+  const wanted = rows[420]!
+  expect(wanted.k).toBe('f')
+  expect(await far.find({ type: 'Text', text: wanted.t, in: 'tree' })).toBeDefined()
+  expect(await far.find({ type: 'Text', text: rows[100]!.t, in: 'tree' })).toBeUndefined()
+
+  // A click there opens that row's file
+  await far.pointer({ type: 'down', x: 1, y: 420, button: 'left', in: 'tree' })
+  expect((await far.find({ type: 'Code' }))?.props.path).toBe(`C:\\proj\\${wanted.t}`)
+  await far.unmount()
+})
+
+test('a selected row stays selected while rows are drawn above it', IT, async ($, on) => {
+  const { clock } = project(on, {
+    'C:\\proj\\docs\\notes.md': 'x\n',
+    'C:\\proj\\src\\login.ts': 'a\n',
+    'C:\\proj\\README.md': 'x\n',
+  })
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const tinted = async () =>
+    (await ui.findAll({ type: 'Box', in: 'tree' }))
+      .filter(box => box.props.backgroundColor === SELECTED)
+      .map(box => box.text.trim())
+  await ui.pointer({ type: 'down', x: 1, y: (await rowsOf(ui)).findIndex(row => row.t === 'docs'), button: 'left', in: 'tree' })
+  expect(await tinted()).toEqual(['▾ docs'])
+
+  // Claude changes a file: its section is drawn above the tree, and every row moves down
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\src\\login.ts', old_string: 'a', new_string: 'b' })
+  await clock.advance(300)
+  expect(await tinted()).toEqual(['▾ docs'])
+
+  // Enter acts on it, not on what now stands where it stood
+  await ui.key({ key: 'return', in: 'tree' })
+  expect(await ui.find({ type: 'Code' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: /notes\.md/, in: 'tree' })).toBeUndefined()
+  expect(await tinted()).toEqual(['▸ docs'])
+  await ui.unmount()
+})
+
+test('a slow scan never holds the next prompt, and still marks the turn it began for', IT, async ($, on) => {
+  const files: Record<string, string> = {}
+  const head: Record<string, string> = {}
+  for (let n = 0; n < 30; n++) {
+    files[`C:\\proj\\f${n}.ts`] = 'a\n'
+    head[`f${n}.ts`] = 'a\n'
+  }
+  // Each committed text takes half a second: thirty of them, fifteen seconds of scan
+  const { clock, touch } = project(on, files, { head, showDelay: 500 })
+  await $.turn.start({ text: 'formatta', turnId: 't1' })
+  await clock.advance(1)
+  // One command rewrites every file, as a formatter does, and the turn ends at once
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\f0.ts b\n' })
+  for (let n = 1; n < 30; n++) touch(`C:\\proj\\f${n}.ts`, 'b\n')
+  await $.turn.complete(done('t1'))
+  await clock.advance(0)
+
+  // The next prompt waits two seconds at most, then its turn begins and edits a file the scan is on
+  const next = $.turn.start({ text: 'ancora', turnId: 't2' })
+  await clock.advance(2000)
+  await next
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\f0.ts', old_string: 'b', new_string: 'c' })
+
+  // The scan ends beside it: every file is the first turn's, as the first turn left it
+  await clock.advance(20_000)
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: 'Turno 2' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 file' })).toBeDefined()
+  await ui.press({ key: 'prev' })
+  expect(await ui.find({ type: 'Text', text: '30 file' })).toBeDefined()
+  await ui.press({ key: 'chg:c:/proj/f0.ts' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -1,1 +1,1 @@\n-a\n+b')
+  await ui.unmount()
+})
+
+test('scans that find the same files list the project no more, and draw nothing again', IT, async ($, on) => {
+  const { clock, catalogs } = project(on, { 'C:\\proj\\a.ts': 'x\n' }, { head: { 'a.ts': 'x\n' } })
+  // What git's answer and the catalogue are written as, while the commands run
+  const written: string[] = []
+  on('state.set', { plugin: 'canopy' }, (_, e, next) => {
+    written.push(e.key)
+
+    return next(e)
+  })
+  await $.turn.start({ text: 'sed', turnId: 't1' })
+  await clock.advance(1)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await clock.advance(400)
+  await clock.advance(300)
+  const listed = catalogs.count
+  written.length = 0
+
+  // Commands that change nothing more: git asked each time, the same answer, no list and no write
+  for (let n = 0; n < 3; n++) {
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    await clock.advance(400)
+    await clock.advance(300)
+  }
+  expect(catalogs.count).toBe(listed)
+  expect(written.filter(key => key === 'git' || key === 'catalog')).toEqual([])
+
+  // A file made: listed again, and the search finds it
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\b.ts z\n' })
+  await clock.advance(400)
+  await clock.advance(300)
+  expect(catalogs.count).toBe(listed + 1)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await ui.input({ key: 'search', text: 'b.ts', kind: 'change' })
+  expect((await rowsOf(ui)).map(row => row.t)).toEqual(['1 file', 'b.ts'])
+  await ui.unmount()
+
+  // And, a minute on, once more whatever git says: an ignore rule may have changed
+  await clock.advance(60_000)
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  await clock.advance(400)
+  await clock.advance(300)
+  expect(catalogs.count).toBe(listed + 2)
+})
+
+test('the texts a turn keeps for its diffs are bounded: past the room, a file is too large to show', IT, async ($, on) => {
+  // Eight files of 900,000 characters: a turn keeps six million at most
+  const big = 'x\n'.repeat(450_000)
+  const names = Array.from({ length: 8 }, (_, n) => `C:\\proj\\big${n}.txt`)
+  const { clock } = project(on, Object.fromEntries(names.map(name => [name, big])))
+  const kept = new Map<string, { before?: { kind: string } }>()
+  on('state.set', { plugin: 'canopy', key: 'snapshot' }, (_, e, next) => {
+    if (e.id !== undefined) kept.set(e.id, e.value as { before?: { kind: string } })
+
+    return next(e)
+  })
+
+  await $.turn.start({ text: 'riscrivi', turnId: 't1' })
+  for (const name of names) await $.tool.call({ tool: 'Edit', file_path: name, old_string: 'x', new_string: 'y' })
+  await clock.advance(300)
+  expect(names.map(name => kept.get(`t1|${name.toLowerCase().replace(/\\/g, '/')}`)?.before?.kind)).toEqual([
+    'text', 'text', 'text', 'text', 'text', 'text', 'too-large', 'too-large',
+  ])
+
+  // Still listed, and the file view says why there is no diff
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ type: 'Text', text: '8 file' })).toBeDefined()
+  await ui.press({ key: 'chg:c:/proj/big7.txt' })
+  expect(await ui.find({ type: 'Code' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /confronto non disponibile/ })).toBeDefined()
+  await ui.unmount()
+
+  // A new turn has its own room
+  await $.turn.complete(done('t1'))
+  await $.turn.start({ text: 'ancora', turnId: 't2' })
+  await $.tool.call({ tool: 'Edit', file_path: names[0]!, old_string: 'x', new_string: 'z' })
+  expect(kept.get('t2|c:/proj/big0.txt')?.before?.kind).toBe('text')
+})
+
+test('a /clear or a /resume empties the history first, the texts after', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\b.ts': 'x\n' })
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  // Each text cleared takes a second: past an end's short bound, the last ones would not be
+  let isSlow = false
+  on('state.set', { plugin: 'canopy', key: 'snapshot' }, async (_, e, next) => {
+    if (isSlow) await clock.sleep(1000)
+
+    return next(e)
+  })
+  const noTurn = 'Ancora nessun turno: quando Claude lavora, i file che tocca si colorano qui.'
+
+  for (const reason of ['clear', 'resume'] as const) {
+    await $.turn.start({ text: 'cambia', turnId: `t-${reason}` })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'x', new_string: 'y' })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\b.ts', old_string: 'x', new_string: 'y' })
+    await $.turn.complete(done(`t-${reason}`))
+    await clock.advance(300)
+
+    isSlow = true
+    const ending = $.session.end({ reason, sessionId: 's1', resume: { id: 's1' } })
+    await clock.settle()
+    // The texts still being cleared, the pane already has no turn to show
+    const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+    expect(await ui.find({ type: 'Text', text: noTurn })).toBeDefined()
+    await ui.unmount()
+    await clock.advance(5000)
+    await ending
+    isSlow = false
+  }
+})
+
+test('a large file shown as it is draws the lines that fit, whole, and says the rest is not drawn', IT, async ($, on) => {
+  // Some 800,000 characters, read and left unchanged
+  const lines = Array.from({ length: 20_000 }, (_, n) => `const value${n} = ${n} // a line of words`)
+  project(on, { 'C:\\proj\\big.ts': `${lines.join('\n')}\n`, 'C:\\proj\\small.ts': 'a\nb\n' })
+  await $.turn.start({ text: 'leggi', turnId: 't1' })
+  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\big.ts' })
+  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\small.ts' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'file:c:/proj/big.ts' })
+  const source = String((await ui.find({ type: 'Code' }))?.props.source)
+  // Within the room a drawing gives its code, cut at a line's end
+  expect(source.length).toBeLessThanOrEqual(90_000)
+  expect(source.length).toBeGreaterThan(80_000)
+  const drawn = source.split('\n')
+  expect(drawn).toEqual(lines.slice(0, drawn.length))
+  expect(await ui.find({ type: 'Text', text: '… il resto del file non è mostrato qui' })).toBeDefined()
+
+  // A file that fits is drawn whole, with no note
+  await ui.press({ key: 'back' })
+  await ui.press({ key: 'file:c:/proj/small.ts' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('a\nb')
+  expect(await ui.find({ type: 'Text', text: /il resto del file/ })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a file with nothing to count against, or no text to count, is read once at most', IT, async ($, on) => {
+  // Unknown to git and binary as the turn begins: nothing kept of it. Tracked text, then written binary
+  const { clock, reads } = project(
+    on,
+    { 'C:\\proj\\data.bin': '\u0000old', 'C:\\proj\\img.dat': 'text\n' },
+    { head: { 'img.dat': 'text\n' } },
+  )
+  await $.turn.start({ text: 'genera', turnId: 't1' })
+  await clock.advance(1)
+  const before = reads.count
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\data.bin \u0000new' })
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\img.dat \u0000bin' })
+  await clock.advance(400)
+  await clock.advance(300)
+  // The binary text found once; the file with no start to count from never
+  expect(reads.count - before).toBe(1)
+
+  // Commands that write nothing: neither is read again
+  const counted = reads.count
+  for (let n = 0; n < 3; n++) {
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    await clock.advance(400)
+    await clock.advance(300)
+  }
+  expect(reads.count).toBe(counted)
+
+  // Both listed, neither counted
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const listed = (await rowsOf(ui)).filter(row => row.i === 1)
+  expect(listed.map(row => [row.t, row.s])).toEqual([
+    ['data.bin', undefined],
+    ['img.dat', undefined],
+  ])
+  await ui.unmount()
+})
+
+// ---- Tidy ----
+
+test('an open file is read again only once it changed on disk, not at every redraw', IT, async ($, on) => {
+  const { clock, reads } = project(on, { 'C:\\proj\\a.ts': 'one\n' })
+  await $.turn.start({ text: 'cerca', turnId: 't1' })
+  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\a.ts' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'file:c:/proj/a.ts' })
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one')
+  // Commands redraw the pane while the file is open: it is not read again
+  const before = reads.count
+  for (let n = 0; n < 5; n++) {
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one')
+  }
+  expect(reads.count).toBe(before)
+
+  // Written: read again, and shown as it is now
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts two\n' })
+  await clock.advance(1)
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('two')
+  await ui.unmount()
+})
+
+test('a closed file view lets go of what it kept: opened again, the file is read afresh', IT, async ($, on) => {
+  const { reads } = project(on, { 'C:\\proj\\a.ts': 'one\n' })
+  await $.turn.start({ text: 'cerca', turnId: 't1' })
+  await $.tool.call({ tool: 'Read', file_path: 'C:\\proj\\a.ts' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'file:c:/proj/a.ts' })
+  await ui.press({ key: 'back' })
+  const before = reads.count
+  await ui.press({ key: 'file:c:/proj/a.ts' })
+  expect(reads.count).toBe(before + 1)
+  expect((await ui.find({ type: 'Code' }))?.props.source).toBe('one')
+  await ui.unmount()
+})
+
+test('comparisons write over one file per side: the temporary folder does not fill up', IT, async ($, on) => {
+  const idea = 'C:\\Users\\me\\AppData\\Local\\Programs\\IntelliJ IDEA Ultimate\\bin\\idea64.exe'
+  const { clock, saved } = project(on, { 'C:\\proj\\a.ts': 'one\n', [idea]: '' })
+  mock.env(on, { OS: 'Windows_NT', LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local', TEMP: 'C:\\Temp' })
+  sessionEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+
+  for (const [turnId, from, to] of [['t1', 'one', 'two'], ['t2', 'two', 'three'], ['t3', 'three', 'four']] as const) {
+    await $.turn.start({ text: 'cambia', turnId })
+    await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: from, new_string: to })
+    await $.turn.complete(done(turnId))
+  }
+
+  // Each turn compared, the latest against the file itself, the older ones as they left it
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'chg:c:/proj/a.ts' })
+  await ui.press({ key: 'editor:compare' })
+  for (let n = 0; n < 2; n++) {
+    await ui.press({ key: 'prev' })
+    await ui.press({ key: 'editor:compare' })
+  }
+  expect([...saved.keys()].map(path => path.slice(path.lastIndexOf('\\') + 1)).sort()).toEqual([
+    'a (dopo il turno).ts',
+    'a (prima del turno).ts',
+  ])
+  // Each written over with the last comparison's texts: the first turn's
+  const side = (name: string) => saved.get([...saved.keys()].find(path => path.endsWith(name))!)
+  expect(side('a (prima del turno).ts')).toBe('one\n')
+  expect(side('a (dopo il turno).ts')).toBe('two\n')
+  await ui.unmount()
+})
+
+test('past the rows a pane lists at most, a desktop’s list still says it was cut, at its end', IT, async ($, on) => {
+  // Three folders of 290 files, each holding a change and so open: some 880 rows
+  const files: Record<string, string> = {}
+  for (const dir of ['a', 'b', 'c']) {
+    for (let n = 0; n < 290; n++) files[`C:\\proj\\${dir}\\f${String(n).padStart(3, '0')}.ts`] = 'x\n'
+  }
+  const { clock } = project(on, files)
+  await $.turn.start({ text: 'tutto', turnId: 't1' })
+  for (const dir of ['a', 'b', 'c']) {
+    await $.tool.call({ tool: 'Edit', file_path: `C:\\proj\\${dir}\\f000.ts`, old_string: 'x', new_string: 'y' })
+  }
+  await clock.advance(300)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const texts = await ui.findAll({ type: 'Text', in: 'tree' })
+  expect(texts.at(-1)?.text).toBe('… elenco troncato: chiudi qualche cartella')
+  await ui.unmount()
+})
+
+test('the tree reads its folders again only once a file came or went, or a moment on', { ...IT, timeoutMs: 15_000 }, async ($, on) => {
+  const { clock, lists, touch } = project(
+    on,
+    { 'C:\\proj\\src\\a.ts': 'x\n', 'C:\\proj\\README.md': '#\n' },
+    { head: { 'src/a.ts': 'x\n', 'README.md': '#\n' } },
+  )
+  await $.turn.start({ text: 'lavora', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\src\\a.ts', old_string: 'x', new_string: 'y' })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  const isShown = async (name: string) => (await ui.find({ key: `file:c:/proj/src/${name}` })) !== undefined
+  expect(await isShown('a.ts')).toBe(true)
+
+  // While Claude works the pane is drawn again and again: commands, scans, counts. The folders stay as read
+  const before = lists.count
+  for (let n = 0; n < 3; n++) {
+    await $.tool.call({ tool: 'Bash', command: 'ls' })
+    await clock.advance(400)
+    await clock.advance(300)
+    expect(await isShown('a.ts')).toBe(true)
+  }
+  expect(lists.count).toBe(before)
+
+  // A file Claude makes is there at once; one a command makes, as soon as git sees it
+  await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\src\\b.ts', content: 'z\n' })
+  expect(await isShown('b.ts')).toBe(true)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\src\\c.ts w\n' })
+  await clock.advance(400)
+  expect(await isShown('c.ts')).toBe(true)
+
+  // One made in an editor, which nothing tells: within a moment
+  touch('C:\\proj\\src\\d.ts', 'v\n')
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(await isShown('d.ts')).toBe(false)
+  await new Promise<void>(resolve => setTimeout(resolve, 2100))
+  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  expect(await isShown('d.ts')).toBe(true)
   await ui.unmount()
 })

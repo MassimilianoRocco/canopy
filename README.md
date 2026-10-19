@@ -1,7 +1,7 @@
 # Canopy
 
 A live project tree beside your Claude Code conversation. Every file Claude
-reads or changes lights up in the tree, turn by turn, and a click shows that
+changes lights up in the tree, turn by turn, and a click shows that
 turn's diff — or sends you to the exact line in IntelliJ or VS Code.
 
 Like a cockpit canopy, it is the glass you look through while Claude flies:
@@ -17,10 +17,12 @@ the whole project under it, and what each turn touched marked on it.
   (`+12 −3`), a word where the colour means more than a change (*new*,
   *renamed*, *untracked*), and a dot on every folder holding a change. It folds
   like the sections above it.
-- **Each turn's footprint**: the files Claude edited or created, the ones it
-  only read, and the ones its shell commands wrote (`sed`, `npm install`,
-  code generators) — which file-tool-only views miss. A line above the lists
-  sums it up: how many files, how many lines, how many commands.
+- **Each turn's footprint**: the files Claude edited or created, and the ones
+  its shell commands wrote (`sed`, `npm install`, code generators) — which
+  file-tool-only views miss. A line above the lists sums it up: how many files,
+  how many lines, how many commands. What Claude only reads or searches is left
+  out: it says little (what it read in earlier turns it still knows), and would
+  draw the pane again for nothing.
 - **Other changes**, in their own folded section: files that changed during the
   turn outside Claude's edits and commands (you in your IDE, a formatter run by
   a hook, a watcher left running).
@@ -42,7 +44,9 @@ the whole project under it, and what each turn touched marked on it.
   own `↗`.
 - **Compare in IntelliJ / VS Code** opens the editor's own diff of that turn
   alone: the file as the turn found it beside the file now — side by side,
-  editable, each block revertible from the editor.
+  editable, each block revertible from the editor. The older side is a copy in
+  the temporary folder (`login (before the turn).ts`), written over at each
+  comparison rather than piled up.
 - What git ignores (`node_modules/`, `dist/`, `.env`) is dimmed and never opened
   by itself.
 - On a desktop: hover highlight, keyboard navigation (↑ ↓ Enter ← →) after a click
@@ -105,7 +109,16 @@ Any JetBrains IDE works through its launcher (`webstorm64.exe`, `pycharm`…).
 
 - One git repository: the project folder or a folder inside one.
 - Files over 1 MB are listed but not diffed. A diff too long for one drawing
-  (some 90,000 characters) shows only its changes, as many as fit.
+  (some 90,000 characters) shows only its changes, as many as fit; a file shown
+  as it is, its first lines. The texts kept for the diffs are bounded too: past
+  some six million characters in one turn (24 million in all), a file is
+  listed but not diffed.
+- The tree lists 800 rows at most, 300 a folder, and says so where it stops:
+  close a few folders to see the rest. On a desktop the list draws the rows
+  around what the pane shows, and draws the next ones as you scroll.
+- After a command, git is asked about the first 200 files it lists as changed:
+  in a repository with more (a folder of untracked files, say), a change to a
+  file further down that list goes unseen.
 - A file changed by a command is attributed by time: written while one of
   Claude's commands ran is Claude's, anything else is an *other change*. A
   command left running in the background counts as running until its turn

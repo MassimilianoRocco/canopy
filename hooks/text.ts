@@ -26,7 +26,6 @@ const en = {
 
   // The summary above the lists
   files: (n: number) => count(n, 'file', 'files'),
-  reads: (n: number) => count(n, 'read', 'read'),
   commands: (n: number) => count(n, 'command', 'commands'),
   others: (n: number) => count(n, 'other change', 'other changes'),
   elsewhere: (n: number) => `${n} outside the project`,
@@ -36,7 +35,7 @@ const en = {
   askingGit: 'Asking git…',
   noRepo: 'No git repository here.',
   noChangesCommit: 'No changes since the last commit.',
-  nothingTouched: 'No files touched in this turn.',
+  nothingTouched: 'No files changed in this turn.',
 
   // Sections and lists
   changes: 'Changes',
@@ -59,8 +58,6 @@ const en = {
   modifiedTimes: (n: number) => `modified ×${n}`,
   plusCommand: ' + a command',
   modifiedByCommand: 'changed by a command',
-  read: 'read',
-  readTimes: (n: number) => `read ×${n}`,
   failed: 'failed',
   outside: 'changed during the turn, outside Claude’s edits and commands',
   outsideShort: 'changed during the turn',
@@ -88,6 +85,7 @@ const en = {
   onlyChanges: 'Only changes',
   wholeTooLarge: 'too large to draw whole: only its changes',
   restNotDrawn: '… the rest of the changes is not drawn here',
+  restOfFile: '… the rest of the file is not drawn here',
   noCompare: 'no comparison available',
   unchangedHead: 'unchanged since the last commit',
   unchangedTurn: 'not changed in this turn',
@@ -97,8 +95,9 @@ const en = {
   editorFailed: (editor: string) => `Could not start ${editor}. Set its launcher in Canopy’s options.`,
   editorRefused: (editor: string) =>
     `${editor} starts through a script that would misread this file’s name. Set its .exe as the launcher in Canopy’s options.`,
-  beforeTurn: (n: number) => `before turn ${n}`,
-  afterTurn: (n: number) => `after turn ${n}`,
+  // A comparison's sides as their files are named: one name each, written over, so they never pile up
+  sideBefore: 'before the turn',
+  sideAfter: 'after the turn',
   lastCommit: 'last commit',
 }
 
@@ -123,7 +122,6 @@ const it: Strings = {
   searchOpen: 'Apri il primo',
 
   files: n => count(n, 'file', 'file'),
-  reads: n => count(n, 'letto', 'letti'),
   commands: n => count(n, 'comando', 'comandi'),
   others: n => count(n, 'altra modifica', 'altre modifiche'),
   elsewhere: n => `${n} fuori dal progetto`,
@@ -132,7 +130,7 @@ const it: Strings = {
   askingGit: 'Interrogo git…',
   noRepo: 'Qui non c’è un repository git.',
   noChangesCommit: 'Nessuna modifica dall’ultimo commit.',
-  nothingTouched: 'Nessun file toccato in questo turno.',
+  nothingTouched: 'Nessun file modificato in questo turno.',
 
   changes: 'Modifiche',
   otherChanges: 'Altre modifiche',
@@ -153,8 +151,6 @@ const it: Strings = {
   modifiedTimes: n => `modificato ×${n}`,
   plusCommand: ' + un comando',
   modifiedByCommand: 'modificato da un comando',
-  read: 'letto',
-  readTimes: n => `letto ×${n}`,
   failed: 'non riuscito',
   outside: 'cambiato durante il turno, fuori dalle modifiche e dai comandi di Claude',
   outsideShort: 'cambiato durante il turno',
@@ -180,6 +176,7 @@ const it: Strings = {
   onlyChanges: 'Solo modifiche',
   wholeTooLarge: 'troppo grande per mostrarlo intero: solo le modifiche',
   restNotDrawn: '… il resto delle modifiche non è mostrato qui',
+  restOfFile: '… il resto del file non è mostrato qui',
   noCompare: 'confronto non disponibile',
   unchangedHead: 'invariato dall’ultimo commit',
   unchangedTurn: 'non modificato in questo turno',
@@ -189,8 +186,8 @@ const it: Strings = {
   editorFailed: editor => `Non riesco ad avviare ${editor}. Indica il suo launcher nelle opzioni di Canopy.`,
   editorRefused: editor =>
     `${editor} si avvia tramite uno script che leggerebbe male il nome di questo file. Indica il suo .exe come launcher nelle opzioni di Canopy.`,
-  beforeTurn: n => `prima del turno ${n}`,
-  afterTurn: n => `dopo il turno ${n}`,
+  sideBefore: 'prima del turno',
+  sideAfter: 'dopo il turno',
   lastCommit: 'ultimo commit',
 }
 

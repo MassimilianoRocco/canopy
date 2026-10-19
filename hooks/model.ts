@@ -13,7 +13,6 @@ export const orphan = (): TurnRecord => ({
   durationMs: null,
   endReason: null,
   files: [],
-  searches: 0,
   commands: 0,
   runs: [],
 })
@@ -41,7 +40,6 @@ export const withFile = (
 ): TurnRecord => {
   const fresh: TouchedFile = {
     ...seed,
-    reads: 0,
     edits: 0,
     isCreated: false,
     running: 0,
@@ -68,28 +66,27 @@ export const isOutside = (file: TouchedFile) => file.via === 'outside' && !isCla
 /** A file whose turn diff is kept. */
 export const hasDiff = (file: TouchedFile) => isClaude(file) || isOutside(file)
 
-export const isRead = (file: TouchedFile) => !hasDiff(file) && (file.reads > 0 || file.pending === 'read')
-
-/** Nothing happened to it, nothing is under way: a failed read leaves such a row behind. */
-export const isBlank = (file: TouchedFile) =>
-  file.reads === 0 &&
-  file.edits === 0 &&
-  file.failures === 0 &&
-  file.running === 0 &&
-  !file.isCreated &&
-  file.via === undefined
-
-/** Shows up in the Changes list: Claude's changes, and its refused edits. */
-export const isChange = (file: TouchedFile) => !isRead(file) && !isOutside(file)
-
+// What a turn did to a file, as its colour says; nothing for a row with nothing
+// to say (a read an earlier version of Canopy kept)
 export const toneOf = (file: TouchedFile | undefined): Tone => {
   if (file === undefined) return ''
-  if (isRead(file)) return 'read'
   if (isOutside(file)) return 'outside'
   if (file.isCreated) return 'created'
   if (isClaude(file)) return 'changed'
 
-  return 'failed'
+  return file.failures > 0 ? 'failed' : ''
+}
+
+/** One entry of a section's list, whichever view drew it: the turn's changes, or git's. */
+export type Change = {
+  key: string
+  path: string
+  label: string
+  tone: Tone
+  /** What its colour says, where it is more than a modification: `new`, `deleted`. */
+  word?: string
+  /** Its lines added and removed, once counted. */
+  counts?: [number, number]
 }
 
 // ---- How a file reads ----
@@ -126,19 +123,13 @@ export const badgeOf = (s: Strings, file: TouchedFile) => {
     return (file.edits > 1 ? s.modifiedTimes(file.edits) : s.modified) + (file.via === 'shell' ? s.plusCommand : '')
   }
   if (file.via === 'shell') return s.modifiedByCommand
-  if (file.reads > 0) return file.reads > 1 ? s.readTimes(file.reads) : s.read
 
   return s.failed
 }
 
-// Colour says changed or new; words only for what colour can't
-export const noteOf = (s: Strings, file: TouchedFile | undefined) => {
-  if (file === undefined) return undefined
-  if (file.running > 0) return s.badgeRunning
-  if (isRead(file)) return badgeOf(s, file)
-
-  return undefined
-}
+// Colour says changed or new; words only for what colour can't: an edit under way
+export const noteOf = (s: Strings, file: TouchedFile | undefined) =>
+  file !== undefined && file.running > 0 ? s.badgeRunning : undefined
 
 // ---- Colours and letters, as an IDE's tree prints them ----
 
