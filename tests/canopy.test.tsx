@@ -1961,3 +1961,48 @@ test('the tree reads its folders again only once a file came or went, or a momen
   expect(await isShown('d.ts')).toBe(true)
   await ui.unmount()
 })
+
+test('a file’s view copies its path as a prompt takes it, and says so', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\src\\login.ts': 'a\n' })
+  // What reached the clipboard, and on which surface; and what the person was told
+  const copied: { text: string; surface: string | undefined }[] = []
+  let isRefused = false
+  on('ui.copy', (_, e) => {
+    copied.push({ text: e.text, surface: e.surface })
+
+    return { value: isRefused ? { isCopied: false as const, reason: 'no-clipboard' as const } : { isCopied: true as const } }
+  })
+  const toasts: string[] = []
+  on('ui.toast', (_, e) => {
+    toasts.push(e.text)
+
+    return { value: undefined }
+  })
+
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\src\\login.ts', old_string: 'a', new_string: 'b' })
+  await $.tool.call({ tool: 'Write', file_path: 'C:\\Temp\\notes.txt', content: 'uno\n' })
+  await clock.advance(300)
+
+  // From the project's folder, on the surface the button was pressed on
+  for (const surface of SURFACES) {
+    const ui = await $.ui.mount({ ...PANE, surface })
+    await listOf(ui, surface).click('chg:c:/proj/src/login.ts', 'login.ts')
+    await ui.press({ key: 'copy:path' })
+    expect(copied.at(-1)).toEqual({ text: 'src/login.ts', surface })
+    expect(toasts.at(-1)).toBe('Copiato: src/login.ts')
+    await ui.press({ key: 'back' })
+    await ui.unmount()
+  }
+
+  // A file outside the project: its whole path. And a clipboard that refused: said so
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'section:elsewhere' })
+  await ui.press({ key: 'chg:c:/temp/notes.txt' })
+  await ui.press({ key: 'copy:path' })
+  expect(copied.at(-1)?.text).toBe('C:/Temp/notes.txt')
+  isRefused = true
+  await ui.press({ key: 'copy:path' })
+  expect(toasts.at(-1)).toBe('Non riesco a copiare il percorso qui.')
+  await ui.unmount()
+})

@@ -7,6 +7,7 @@ import type { EditorChoice } from './editor'
 import { rootOf, textOf } from './git'
 import { forgetListings } from './listing'
 import { isClaude, withFile, withTurn } from './model'
+import { noteFault } from './actions'
 import { PANE, actOn, renderPane } from './pane'
 import { isRecord, keyOf, labelOf } from './paths'
 import {
@@ -279,6 +280,14 @@ export const register: Register = (on, options) => {
     const { gen, row } = e.data
     if (typeof gen !== 'number' || typeof row !== 'number') return next(e)
     await actOn($, gen, row)
+
+    return next(e)
+  })
+
+  // The desktop's list failed (an engine that changed, a drawing past a bound): the pane, which
+  // the engine draws again right after, leaves it out there and lists Buttons instead
+  on('ui.fault', ($, e, next) => {
+    if (e.requestId === PANE && e.element === 'tree') noteFault(e.surface, e.reason)
 
     return next(e)
   })

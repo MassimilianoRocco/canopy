@@ -1,6 +1,6 @@
 {
   "name": "canopy",
-  "version": "1.3.0",
+  "version": "1.4.0",
   "description": "A live project tree beside the conversation: the files Claude reads and changes, turn by turn, with each turn's diff",
   "author": { "name": "Massimiliano Rocco" },
   "license": "MIT",

@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { Lang, Mode, TurnRecord } from '../types'
-import { openFile } from './actions'
+import { faultOn, openFile } from './actions'
 import { currentEditor } from './editor'
 import { releaseFileView, renderFile } from './fileview'
 import { indexOf, rootOf } from './git'
@@ -42,8 +42,10 @@ export async function renderPane(
   const elements = $.ui.resolve(e)
   const { Box, Text, Button } = elements
   // A desktop draws Buttons as native controls, which drop the colour of
-  // their label: there the clickable list is a Client of coloured rows
-  const Client = e.surface === 'desktop' && 'Client' in elements ? elements.Client : undefined
+  // their label: there the clickable list is a Client of coloured rows, unless
+  // it failed there, when Buttons it is all the same
+  const fault = faultOn(e.surface)
+  const Client = e.surface === 'desktop' && 'Client' in elements && fault === undefined ? elements.Client : undefined
   const Input = 'Input' in elements ? elements.Input : undefined
   const props = (e as { props?: { bodyColumns?: unknown; scroll?: { offset?: unknown; bodyRows?: unknown } } }).props
   const columns = props?.bodyColumns
@@ -308,6 +310,11 @@ export async function renderPane(
       {lists}
       {/* On a desktop the list says it itself, where it cut the rows or drew fewer */}
       {isCut && Client === undefined && <Text dimColor>{s.cut}</Text>}
+      {fault !== undefined && (
+        <Text dimColor size="footnote" wrap="truncate-end">
+          {s.listFallback(fault)}
+        </Text>
+      )}
     </Box>
   )
 }

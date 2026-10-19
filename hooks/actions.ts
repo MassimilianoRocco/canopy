@@ -33,6 +33,17 @@ export function remember(targets: (Target | null)[]) {
   return generation
 }
 
+// The surfaces where the list of coloured rows failed, and why as the surface said it:
+// the engine draws the pane again at once, and there the list is Buttons, as on a terminal
+const faults = new Map<string, string>()
+
+export const noteFault = (surface: string, reason: string) => {
+  faults.set(surface, reason)
+}
+
+/** Why the coloured list failed on `surface`; undefined while it never did. */
+export const faultOn = (surface: string) => faults.get(surface)
+
 // The file opened last: its row stays tinted, as an editor's selection does
 let selectedKey: string | undefined
 

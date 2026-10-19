@@ -265,6 +265,11 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
   const prev = pool[(at - 1 + pool.length) % pool.length]
   const next = pool[(at + 1) % pool.length]
   const canCompare = before !== undefined && before.kind !== 'too-large' && after.kind === 'text'
+  // The path as a prompt takes it: from the project's folder, else whole
+  const copyPath = async (press: { surface?: Parameters<typeof $.ui.copy>[0]['surface'] }) => {
+    const copied = await $.ui.copy({ text: file.label, ...(press.surface === undefined ? {} : { surface: press.surface }) })
+    await $.ui.toast(copied.isCopied ? s.pathCopied(file.label) : s.copyFailed)
+  }
 
   return (
     <Box flexDirection="column">
@@ -285,18 +290,21 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
         <Text bold color={TONE_COLOR[tone]} dimColor={tone === 'outside'} strikethrough={tone === 'deleted'}>
           {name}
         </Text>
-        {ide !== undefined && after.kind === 'text' && (
-          <Box flexDirection="row" gap={1}>
+        <Box flexDirection="row" flexWrap="wrap" gap={1}>
+          {ide !== undefined && after.kind === 'text' && (
             <Button key="editor:open" onPress={toEditor(firstLine)}>
               {s.open(ide.name)}
             </Button>
-            {canCompare && (
-              <Button key="editor:compare" onPress={compare}>
-                {s.compare(ide.name)}
-              </Button>
-            )}
-          </Box>
-        )}
+          )}
+          {ide !== undefined && after.kind === 'text' && canCompare && (
+            <Button key="editor:compare" onPress={compare}>
+              {s.compare(ide.name)}
+            </Button>
+          )}
+          <Button key="copy:path" onPress={copyPath}>
+            {s.copyPath}
+          </Button>
+        </Box>
       </Box>
       {crumbs !== '' && (
         <Text dimColor size="footnote" wrap="truncate-start">

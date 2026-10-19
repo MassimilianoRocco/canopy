@@ -93,6 +93,11 @@ const en = {
   compare: (editor: string) => `Compare in ${editor}`,
   openHere: '↗',
   editorFailed: (editor: string) => `Could not start ${editor}. Set its launcher in Canopy’s options.`,
+  copyPath: 'Copy path',
+  pathCopied: (path: string) => `Copied: ${path}`,
+  copyFailed: 'Could not copy the path here.',
+  // The desktop's coloured list failed: why, as the surface said it
+  listFallback: (reason: string) => `The coloured list could not be drawn here (${reason}): this is the plain one.`,
   editorRefused: (editor: string) =>
     `${editor} starts through a script that would misread this file’s name. Set its .exe as the launcher in Canopy’s options.`,
   // A comparison's sides as their files are named: one name each, written over, so they never pile up
@@ -184,6 +189,10 @@ const it: Strings = {
   compare: editor => `Confronta in ${editor}`,
   openHere: '↗',
   editorFailed: editor => `Non riesco ad avviare ${editor}. Indica il suo launcher nelle opzioni di Canopy.`,
+  copyPath: 'Copia percorso',
+  pathCopied: path => `Copiato: ${path}`,
+  copyFailed: 'Non riesco a copiare il percorso qui.',
+  listFallback: reason => `La lista colorata non si è potuta disegnare qui (${reason}): questa è quella semplice.`,
   editorRefused: editor =>
     `${editor} si avvia tramite uno script che leggerebbe male il nome di questo file. Indica il suo .exe come launcher nelle opzioni di Canopy.`,
   sideBefore: 'prima del turno',

@@ -47,10 +47,13 @@ the whole project under it, and what each turn touched marked on it.
   editable, each block revertible from the editor. The older side is a copy in
   the temporary folder (`login (before the turn).ts`), written over at each
   comparison rather than piled up.
+- **Copy path** puts the file's path on the clipboard as a prompt takes it:
+  from the project's folder (`src/app/login.ts`), whole for a file outside it.
 - What git ignores (`node_modules/`, `dist/`, `.env`) is dimmed and never opened
   by itself.
 - On a desktop: hover highlight, keyboard navigation (↑ ↓ Enter ← →) after a click
-  in the list.
+  in the list. Should the coloured list ever fail to draw there, the pane lists
+  plain buttons instead and says why.
 
 ## Cost
 
