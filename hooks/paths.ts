@@ -23,6 +23,23 @@ export const labelOf = (path: string, base: string) => {
 export const tidy = (path: string) =>
   path.replace(/^[A-Za-z]:\/Users\/[^/]+(?=\/|$)/i, '~').replace(/^\/(?:Users|home)\/[^/]+(?=\/|$)/, '~')
 
+// A whole Windows path: a drive's (`C:\`, `C:/`) or a share's (`\\server`). Told by its
+// spelling alone, so no call is made and a path elsewhere is left as it is
+const isWindowsPath = (path: string) => /^[A-Za-z]:[\\/]/.test(path) || path.startsWith('\\\\')
+
+/** A whole path in its system's separators: a Windows one with backslashes, any other as given. */
+export const nativeOf = (path: string) => (isWindowsPath(path) ? path.replace(/\//g, '\\') : path)
+
+/**
+ * A path as shown: the home folder as `~`, and a whole Windows path with its
+ * backslashes. One relative to the project (`src/app`) keeps its slashes.
+ */
+export const shownOf = (path: string) => {
+  const tidied = tidy(slashes(path))
+
+  return isWindowsPath(path) ? tidied.replace(/\//g, '\\') : tidied
+}
+
 /** A label's file name and the folders before it. */
 export const splitLabel = (label: string) => {
   const at = label.lastIndexOf('/')

@@ -2,13 +2,16 @@ import type { EngineInterface } from 'claude-code'
 
 import type { FileText, GitFile, GitStatus } from '../types'
 import { isUnder, joinPath, keyOf, labelOf } from './paths'
+import { gitOf } from './programs'
 
 export const MAX_TEXT = 1_000_000
 const MAX_GIT_FILES = 2000
 const MAX_IGNORED = 2000
 const MAX_INDEX = 100_000
-// Outside a repository the search walks the folder itself, this far at most
+// Outside a repository the search walks the folder itself: this many files at
+// most, and this many folders opened, so a tree of folders holding few files ends too
 const MAX_WALK = 20_000
+const MAX_WALKED = 2000
 
 // Folders never opened by themselves, dimmed even outside a repository
 export const HEAVY = new Set([
@@ -44,6 +47,11 @@ type Session = {
   cwd: () => Promise<string>
 }
 
+type Env = { get: (name: string) => Promise<string | undefined> }
+
+/** What starting git takes: a process, the session's folders, and the variables that say where git is. */
+type Git = { process: Process; session: Session; env: Env }
+
 // The project's folder, the tree's root: a shell `cd` moves the cwd, never this
 export function rootOf($: { session: Session }) {
   return $.session.root().catch(() => $.session.cwd()).catch(() => '')
@@ -54,11 +62,13 @@ let repoTop: string | undefined
 
 // Asked from the project's folder: from the session's cwd, which a shell `cd`
 // moves, it could name another repository and keep it
-export async function topOf($: { process: Process; session: Session }): Promise<string | null> {
+export async function topOf($: Git): Promise<string | null> {
   if (repoTop !== undefined) return repoTop
+  const program = await gitOf($)
+  if (program === null) return null
   const base = await rootOf($)
   const out = await $.process
-    .run(['git', 'rev-parse', '--show-toplevel'], { ...(base === '' ? {} : { cwd: base }), timeoutMs: 5000 })
+    .run([program, 'rev-parse', '--show-toplevel'], { ...(base === '' ? {} : { cwd: base }), timeoutMs: 5000 })
     .catch(() => undefined)
   const top = out?.exitCode === 0 ? out.stdout.trim().replace(/\/+$/, '') : ''
   if (top === '') return null
@@ -80,8 +90,26 @@ const codeOf = (xy: string): GitFile['code'] => {
 // Every git call here runs without optional locks, as an editor's scan does:
 // a plain status refreshes the index under `index.lock`, and a commit the
 // model runs meanwhile would fail
-function git($: { process: Process }, top: string, args: readonly string[]) {
-  return $.process.run(['git', '--no-optional-locks', ...args], { cwd: top, timeoutMs: 10_000 }).catch(() => undefined)
+async function git($: Git, top: string, args: readonly string[]) {
+  const program = await gitOf($)
+  if (program === null) return undefined
+
+  return $.process.run([program, '--no-optional-locks', ...args], { cwd: top, timeoutMs: 10_000 }).catch(() => undefined)
+}
+
+// Past this many files unknown to git in one status, or this long for one,
+// the repository holds folders git neither tracks nor ignores (a `venv/`, a
+// `node_modules/` no .gitignore names), listed file by file after every
+// command: from then on, for the session, git lists each as one entry
+const MAX_UNTRACKED = 2000
+const SLOW_STATUS = 1000
+let untracked: 'all' | 'normal' = 'all'
+
+/** Whether git lists the folders it doesn't know whole, not file by file. */
+export const isFolded = () => untracked === 'normal'
+
+function statusOf($: Git, top: string) {
+  return git($, top, ['status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`])
 }
 
 /**
@@ -92,12 +120,23 @@ function git($: { process: Process }, top: string, args: readonly string[]) {
 export async function readGit($: EngineInterface, withCounts = false): Promise<GitStatus | null> {
   const top = await topOf($)
   if (top === null) return null
-  const out = await git($, top, ['status', '--porcelain=v1', '-z', '--untracked-files=all'])
+  const from = await $.clock.now()
+  let out = await statusOf($, top)
   if (out === undefined || out.exitCode !== 0) return null
+  if (untracked === 'all') {
+    const took = (await $.clock.now()) - from
+    const unknown = out.stdout.split('\0').filter(field => field.startsWith('?? ')).length
+    if (unknown > MAX_UNTRACKED || took > SLOW_STATUS || out.isStdoutTruncated) {
+      untracked = 'normal'
+      out = await statusOf($, top)
+      if (out === undefined || out.exitCode !== 0) return null
+    }
+  }
 
-  // `XY path\0`, a rename or copy followed by its source path
+  // `XY path\0`, a rename or copy followed by its source path; past git's room the last one may be cut
   const files: GitFile[] = []
   const fields = out.stdout.split('\0')
+  if (out.isStdoutTruncated) fields.pop()
   for (let at = 0; at < fields.length && files.length < MAX_GIT_FILES; at++) {
     const field = fields[at]!
     if (field.length < 4) continue
@@ -115,6 +154,7 @@ export async function readGit($: EngineInterface, withCounts = false): Promise<G
 
       return count === undefined ? file : { ...file, added: count[0], removed: count[1] }
     }),
+    ...(isFolded() ? { isFolded: true } : {}),
   }
 }
 
@@ -144,11 +184,12 @@ async function readCounts($: EngineInterface, top: string) {
 }
 
 /** The last commit's text of a repo-relative path; missing when git doesn't track it. */
-export async function headText($: { process: Process; session: Session }, rel: string): Promise<FileText> {
+export async function headText($: Git, rel: string): Promise<FileText> {
   const top = await topOf($)
-  if (top === null) return { kind: 'missing' }
+  const program = await gitOf($)
+  if (top === null || program === null) return { kind: 'missing' }
   const out = await $.process
-    .run(['git', 'show', `HEAD:${rel}`], { cwd: top, timeoutMs: 10_000 })
+    .run([program, 'show', `HEAD:${rel}`], { cwd: top, timeoutMs: 10_000 })
     .catch(() => undefined)
   if (out === undefined || out.exitCode !== 0) return { kind: 'missing' }
   if (out.isStdoutTruncated || out.stdout.length > MAX_TEXT) return { kind: 'too-large' }
@@ -179,8 +220,8 @@ export const indexOf = (base: string) => (index !== undefined && index.base === 
 
 const splitZ = (out: string) => out.split('\0').filter(part => part !== '')
 
-/** What a listing found; `isSameIndex` when the search's files are those it held already. */
-type Found = { top: string; ignored: string[]; count: number; isCut: boolean; isSameIndex: boolean }
+/** What the search's listing found; `isSame` when its files are those the index held already. */
+type Indexed = { count: number; isCut: boolean; isSame: boolean }
 
 // Puts `files` in the index, and says whether they were there already
 const setIndex = (base: string, files: string[]) => {
@@ -195,15 +236,28 @@ const setIndex = (base: string, files: string[]) => {
 }
 
 /**
- * Lists the files under `base` and what git ignores: two `git ls-files`, or
- * outside a repository a bounded walk of the folder that skips the heavy ones.
+ * What git ignores under the repository, lowercased, a folder ending in `/`:
+ * one `git ls-files`, each ignored folder one entry. Null outside a repository.
  */
-export async function readCatalog($: EngineInterface, base: string, status: GitStatus | null): Promise<Found> {
+export async function readIgnored($: EngineInterface): Promise<{ top: string; ignored: string[] } | null> {
+  const top = await topOf($)
+  if (top === null) return null
+  const out = await git($, top, ['ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory'])
+  const ignored = out !== undefined && out.exitCode === 0 ? splitZ(out.stdout).slice(0, MAX_IGNORED) : []
+
+  return { top, ignored: ignored.map(rel => rel.toLowerCase()) }
+}
+
+/**
+ * Lists the files under `base` into the search's index: one `git ls-files`
+ * (a folder git doesn't know as one entry, left out, once it lists them whole),
+ * or outside a repository a bounded walk of the folder that skips the heavy ones.
+ */
+export async function readIndex($: EngineInterface, base: string, status: GitStatus | null): Promise<Indexed> {
   const top = await topOf($)
   if (top !== null) {
-    const listed = await git($, top, ['ls-files', '-z', '--cached', '--others', '--exclude-standard'])
-    const ignoredOut = await git($, top, [
-      'ls-files', '-z', '--others', '--ignored', '--exclude-standard', '--directory',
+    const listed = await git($, top, [
+      'ls-files', '-z', '--cached', '--others', '--exclude-standard', ...(isFolded() ? ['--directory'] : []),
     ])
     if (listed !== undefined && listed.exitCode === 0) {
       const gone = new Set((status?.files ?? []).filter(file => file.code === 'D').map(file => file.rel))
@@ -213,31 +267,26 @@ export async function readCatalog($: EngineInterface, base: string, status: GitS
       const files: string[] = []
       for (const rel of splitZ(listed.stdout)) {
         if (files.length >= MAX_INDEX) break
-        if (gone.has(rel)) continue
+        if (gone.has(rel) || rel.endsWith('/')) continue
         if (prefix === undefined) continue
         if (prefix === '' || rel.toLowerCase().startsWith(prefix.toLowerCase())) files.push(rel.slice(prefix.length))
       }
-      const isSameIndex = setIndex(base, files)
-      const ignored =
-        ignoredOut !== undefined && ignoredOut.exitCode === 0
-          ? splitZ(ignoredOut.stdout).slice(0, MAX_IGNORED).map(rel => rel.toLowerCase())
-          : []
 
       return {
-        top,
-        ignored,
         count: files.length,
         isCut: listed.isStdoutTruncated || files.length >= MAX_INDEX,
-        isSameIndex,
+        isSame: setIndex(base, files),
       }
     }
   }
 
-  // No repository: walk the folder, breadth first
+  // No repository: walk the folder, breadth first, as far as its files and its folders allow
   const files: string[] = []
   const queue: string[] = ['']
-  while (queue.length > 0 && files.length < MAX_WALK) {
+  let walked = 0
+  while (queue.length > 0 && files.length < MAX_WALK && walked < MAX_WALKED) {
     const rel = queue.shift()!
+    walked += 1
     const entries = await $.fs.list(rel === '' ? base : joinPath(base, rel)).catch(() => [])
     for (const entry of entries) {
       if (HIDDEN.has(entry.name)) continue
@@ -249,7 +298,10 @@ export async function readCatalog($: EngineInterface, base: string, status: GitS
       }
     }
   }
-  const isSameIndex = setIndex(base, files)
 
-  return { top: '', ignored: [], count: files.length, isCut: files.length >= MAX_WALK, isSameIndex }
+  return {
+    count: files.length,
+    isCut: files.length >= MAX_WALK || (walked >= MAX_WALKED && queue.length > 0),
+    isSame: setIndex(base, files),
+  }
 }

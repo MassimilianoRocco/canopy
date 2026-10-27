@@ -77,12 +77,17 @@ export type GitFile = {
   removed?: number
 }
 
-/** The last `git status`, its paths relative to `top`, the repository's root. */
-export type GitStatus = { at: number; top: string; files: GitFile[] }
+/**
+ * The last `git status`, its paths relative to `top`, the repository's root.
+ * `isFolded` once git lists a folder it doesn't know as one entry (`venv/`),
+ * not file by file: there were too many such files.
+ */
+export type GitStatus = { at: number; top: string; files: GitFile[]; isFolded?: boolean }
 
 /**
  * What git ignores under the repository (`node_modules/`, `.env`), folders
- * ending in `/`, and every file it would show: the search's catalogue.
+ * ending in `/`; and how many files the search's catalogue holds, once the
+ * search was used (0 until then).
  */
 export type Catalog = { at: number; top: string; ignored: string[]; count: number; isCut: boolean }
 
@@ -112,6 +117,8 @@ declare module 'claude-code' {
       catalog: Catalog | null
       /** The editor Open and Compare reach, by name; null when none was found. */
       editor: string | null
+      /** Whether the shown turn's prompt is drawn whole rather than on one line. */
+      isPromptOpen: boolean
     }
   }
 }

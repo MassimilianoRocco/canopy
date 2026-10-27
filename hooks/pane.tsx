@@ -26,6 +26,7 @@ const git = atom({ plugin: 'canopy', key: 'git' } as const, null)
 const query = atom({ plugin: 'canopy', key: 'query' } as const, '')
 const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
+const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
 
 const primaryIf = (isOn: boolean) => (isOn ? { variant: 'primary' as const } : {})
 
@@ -101,7 +102,8 @@ export async function renderPane(
       changes.push({
         key: keyOf(path),
         path,
-        label: labelOf(path, base),
+        // A folder git lists whole (`venv/`) by its name; its path keeps the slash
+        label: labelOf(path, base).replace(/\/+$/, ''),
         tone,
         ...(word === undefined ? {} : { word }),
         ...(counts === undefined ? {} : { counts }),
@@ -126,6 +128,11 @@ export async function renderPane(
     })
   }
 
+  // The prompt on one line; one longer than the line opens whole with a press, and closes again
+  const isPromptOpen = await read($, promptOpen)
+  const promptRoom = Math.floor((typeof columns === 'number' ? columns : 60) * 0.9) - 3
+  const isPromptLong = turn !== undefined && turn.prompt.length > promptRoom
+
   const header =
     turn === undefined ? (
       <Text dimColor>{s.noTurn}</Text>
@@ -149,9 +156,22 @@ export async function renderPane(
         </Box>
         {/* The code wants the room in the file view */}
         {file === null && turn.prompt !== '' && (
-          <Text dimColor italic wrap="truncate-end">
-            {turn.prompt}
-          </Text>
+          <Box flexDirection="row" gap={1}>
+            <Box flexGrow={1} flexShrink={1}>
+              <Text dimColor italic {...(isPromptOpen && isPromptLong ? {} : { wrap: 'truncate-end' as const })}>
+                {turn.prompt}
+              </Text>
+            </Box>
+            {isPromptLong && (
+              <Button
+                key="prompt"
+                plain
+                dimColor
+                label={isPromptOpen ? '▴' : '▾'}
+                onPress={() => update($, promptOpen, open => !open)}
+              />
+            )}
+          </Box>
         )}
       </Box>
     )
@@ -305,6 +325,12 @@ export async function renderPane(
     <Box flexDirection="column">
       {header}
       {summary}
+      {/* git lists the folders it doesn't know whole: a file a command made in one is not named */}
+      {status?.isFolded === true && (
+        <Text dimColor size="footnote">
+          {s.folded}
+        </Text>
+      )}
       {controls}
       {searchRow}
       {lists}

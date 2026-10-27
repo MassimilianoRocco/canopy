@@ -10,7 +10,7 @@ import type { Editor, Launch } from './editor'
 import { headOf, textOf } from './git'
 import { TONE_COLOR, badgeOf, hasDiff, rangesText } from './model'
 import type { Change } from './model'
-import { keyOf, splitLabel, tidy } from './paths'
+import { keyOf, nativeOf, splitLabel, tidy } from './paths'
 import type { Strings } from './text'
 
 const diffView = atom({ plugin: 'canopy', key: 'diffView' } as const, 'full')
@@ -86,11 +86,16 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
   const at = pool.findIndex(one => one.key === file.key)
   const tone = change?.tone ?? ''
 
+  // A folder git lists whole (unknown to it, or a repository of its own): no text to read
+  const isFolder = /[\\/]$/.test(file.path)
+
   // The two texts and what the older one is: the turn's start, or the last commit
   let before: FileText | undefined
   let after: FileText
   let against: 'turn' | 'head' | undefined
-  if (how === 'commit') {
+  if (isFolder) {
+    after = { kind: 'missing' }
+  } else if (how === 'commit') {
     after = await currentText($, file.path)
     const entry = status === null ? undefined : status.files.find(one => keyOf(`${status.top}/${one.rel}`) === file.key)
     if (status !== null && entry !== undefined) {
@@ -165,7 +170,9 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
   let note = ''
   let firstLine = 1
   const isGone = after.kind === 'missing' && before?.kind === 'text'
-  if (after.kind === 'too-large') {
+  if (isFolder) {
+    body = <Text dimColor>{s.wholeFolder}</Text>
+  } else if (after.kind === 'too-large') {
     body = <Text dimColor>{s.tooLarge}</Text>
   } else if (after.kind === 'missing' && !isGone) {
     body = <Text color="error">{s.gone}</Text>
@@ -265,10 +272,11 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
   const prev = pool[(at - 1 + pool.length) % pool.length]
   const next = pool[(at + 1) % pool.length]
   const canCompare = before !== undefined && before.kind !== 'too-large' && after.kind === 'text'
-  // The path as a prompt takes it: from the project's folder, else whole
+  // The path as a prompt takes it: from the project's folder, else whole, in its system's separators
   const copyPath = async (press: { surface?: Parameters<typeof $.ui.copy>[0]['surface'] }) => {
-    const copied = await $.ui.copy({ text: file.label, ...(press.surface === undefined ? {} : { surface: press.surface }) })
-    await $.ui.toast(copied.isCopied ? s.pathCopied(file.label) : s.copyFailed)
+    const text = nativeOf(file.label)
+    const copied = await $.ui.copy({ text, ...(press.surface === undefined ? {} : { surface: press.surface }) })
+    await $.ui.toast(copied.isCopied ? s.pathCopied(text) : s.copyFailed)
   }
 
   return (

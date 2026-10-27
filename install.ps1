@@ -4,8 +4,9 @@ $here = $PSScriptRoot
 
 $claude = (Get-Command claude -ErrorAction SilentlyContinue).Source
 if (-not $claude) {
-  # The desktop app keeps its own copy of the CLI
-  $claude = Get-ChildItem "$env:APPDATA\Claude\claude-code" -Recurse -Filter claude.exe -ErrorAction SilentlyContinue |
+  # The desktop app keeps its own copy of the CLI: in Roaming, or in Local\Claude-Data for the Store (MSIX) build
+  $folders = "$env:APPDATA\Claude\claude-code", "$env:LOCALAPPDATA\Claude-Data\claude_*\claude-code"
+  $claude = Get-ChildItem $folders -Recurse -Filter claude.exe -ErrorAction SilentlyContinue |
     Sort-Object LastWriteTime -Descending | Select-Object -First 1 -ExpandProperty FullName
 }
 if (-not $claude) {

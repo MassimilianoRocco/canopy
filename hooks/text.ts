@@ -1,4 +1,5 @@
 import type { Lang } from '../types'
+import { systemProgram } from './programs'
 
 const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : many}`
 
@@ -22,7 +23,7 @@ const en = {
   collapse: 'Collapse',
   search: 'Search files…',
   // What Enter does in the search: the first of the results opens
-  searchOpen: 'Open first match',
+  searchOpen: 'Open',
 
   // The summary above the lists
   files: (n: number) => count(n, 'file', 'files'),
@@ -36,6 +37,7 @@ const en = {
   noRepo: 'No git repository here.',
   noChangesCommit: 'No changes since the last commit.',
   nothingTouched: 'No files changed in this turn.',
+  folded: 'Many files unknown to git: a new folder is listed whole, not file by file.',
 
   // Sections and lists
   changes: 'Changes',
@@ -74,6 +76,7 @@ const en = {
   emptyFile: 'Empty file.',
   tooLarge: 'Too large or unreadable to show here.',
   gone: 'The file no longer exists.',
+  wholeFolder: 'A folder git lists whole: its files are not listed one by one.',
   newFile: 'new file',
   sinceTurn: 'since the turn',
   sinceHead: 'since the last commit',
@@ -124,7 +127,7 @@ const it: Strings = {
   refresh: 'Aggiorna',
   collapse: 'Comprimi',
   search: 'Cerca file…',
-  searchOpen: 'Apri il primo',
+  searchOpen: 'Apri',
 
   files: n => count(n, 'file', 'file'),
   commands: n => count(n, 'comando', 'comandi'),
@@ -136,6 +139,7 @@ const it: Strings = {
   noRepo: 'Qui non c’è un repository git.',
   noChangesCommit: 'Nessuna modifica dall’ultimo commit.',
   nothingTouched: 'Nessun file modificato in questo turno.',
+  folded: 'Molti file sconosciuti a git: una cartella nuova è elencata intera, non file per file.',
 
   changes: 'Modifiche',
   otherChanges: 'Altre modifiche',
@@ -170,6 +174,7 @@ const it: Strings = {
   emptyFile: 'File vuoto.',
   tooLarge: 'File troppo grande o illeggibile per mostrarlo qui.',
   gone: 'Il file non esiste più.',
+  wholeFolder: 'Una cartella che git elenca intera: i suoi file non sono elencati uno per uno.',
   newFile: 'file nuovo',
   sinceTurn: 'dal turno',
   sinceHead: 'dall’ultimo commit',
@@ -225,8 +230,9 @@ export async function detectLang($: Probe): Promise<Lang> {
   if (fromEnv !== undefined) return fromEnv
   if ((await $.env.get('OS')) !== 'Windows_NT') return 'en'
 
+  const reg = await systemProgram($, 'reg')
   const out = await $.process
-    .run(['reg', 'query', 'HKCU\\Control Panel\\International', '/v', 'LocaleName'], { timeoutMs: 3000 })
+    .run([reg, 'query', 'HKCU\\Control Panel\\International', '/v', 'LocaleName'], { timeoutMs: 3000 })
     .catch(() => undefined)
   const locale = out?.exitCode === 0 ? /LocaleName\s+REG_SZ\s+(\S+)/.exec(out.stdout)?.[1] : undefined
 

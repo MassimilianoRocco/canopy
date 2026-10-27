@@ -3,10 +3,11 @@ import type { EngineInterface, Timer } from 'claude-code'
 
 import type { FileText, GitFile, GitStatus, Snapshot, TouchedFile, TurnRecord } from '../types'
 import { changesOf, diffLines, linesOf } from './diff'
-import { clearHeads, headText, readCatalog, readGit, rootOf, textOf } from './git'
+import { clearHeads, headText, indexOf, readGit, readIgnored, readIndex, rootOf, textOf } from './git'
 import { forgetListings } from './listing'
 import { hasDiff, isClaude, withFile } from './model'
 import { keyOf, labelOf } from './paths'
+import { isPaneSeen, noteDrawn, owe } from './watch'
 
 const history = atom({ plugin: 'canopy', key: 'history' } as const, [])
 const git = atom({ plugin: 'canopy', key: 'git' } as const, null)
@@ -52,6 +53,22 @@ export const releaseTexts = (turnIds: readonly string[]) => {
   for (const id of turnIds) weights.delete(id)
 }
 
+/**
+ * Counts again the room the session's kept texts take: a module reloaded
+ * (`/reload-plugins`, a mod saved) starts its count over while the texts stay
+ * in the session. Never below what this load counted already.
+ */
+export async function recountTexts($: EngineInterface) {
+  for (const turn of await read($, history)) {
+    let total = 0
+    for (const file of turn.files) {
+      const { before, after } = await read($, atom({ ...SNAPSHOT, id: `${turn.id}|${file.key}` }, {}))
+      for (const text of [before, after]) if (text?.kind === 'text') total += text.text.length
+    }
+    weights.set(turn.id, Math.max(weights.get(turn.id) ?? 0, total))
+  }
+}
+
 // ---- What a turn found as it began ----
 // A command changes a file no tool read first. A clean tracked file was its
 // last commit; for the others (already changed, unknown to git) the texts are
@@ -91,10 +108,20 @@ async function readStart($: EngineInterface): Promise<Start> {
   return { dirty, texts }
 }
 
-/** Reads what the files were as the turn began, on a timer: never on the prompt's path. */
+/**
+ * Reads what the files were as the turn began, on a timer: never on the
+ * prompt's path. Not while nobody sees the pane: a command's change then reads
+ * against the last commit.
+ */
 export function captureStart($: EngineInterface, turnId: string) {
   starts.set(turnId, 'pending')
   for (const old of [...starts.keys()].slice(0, -2)) starts.delete(old)
+  if (!isPaneSeen()) {
+    starts.set(turnId, null)
+    owe()
+
+    return
+  }
   $.clock.after(0, () => {
     void readStart($)
       .catch((): Start => null)
@@ -288,42 +315,81 @@ async function countDue($: EngineInterface) {
   }
 }
 
-// ---- The catalogue the search reads, and what git ignores ----
-
-let isCataloguing = false
+// ---- What git ignores, and the catalogue the search reads ----
+// What git ignores dims the tree: listed as the pane is first drawn, and again
+// by a scan once files came or went. The search's list of every file is made
+// only once the search is used, and again while it is, once files came or went
+// or a minute on (an ignore rule edited): never for a pane nobody searches in
 
 const isSameList = (a: readonly string[], b: readonly string[]) =>
   a.length === b.length && a.every((one, at) => one === b[at])
 
-/** Lists the project again, off every path; a list already under way is not doubled (false). */
-export function refreshCatalog($: EngineInterface, status: GitStatus | null) {
-  if (isCataloguing) return false
-  isCataloguing = true
+const emptyCatalog = (at: number) => ({ at, top: '', ignored: [], count: 0, isCut: false })
+
+let isListingIgnored = false
+let isIgnoredAsked = false
+
+/** Lists what git ignores again, off every path; a list already under way is not doubled (false). */
+export function refreshIgnored($: EngineInterface) {
+  if (isListingIgnored) return false
+  isListingIgnored = true
+  isIgnoredAsked = true
   $.clock.after(0, () => {
     void (async () => {
-      const base = await baseOf($)
-      if (base === '') return
-      const { isSameIndex, ...found } = await readCatalog($, base, status)
+      const found = await readIgnored($)
+      if (found === null) return
       // The same list: nothing to draw again
       const was = await read($, catalog)
-      const isSame =
-        isSameIndex &&
-        was !== null &&
-        was.top === found.top &&
-        was.count === found.count &&
-        was.isCut === found.isCut &&
-        isSameList(was.ignored, found.ignored)
-      if (isSame) return
+      if (was !== null && was.top === found.top && isSameList(was.ignored, found.ignored)) return
       const at = await $.clock.now()
-      await update($, catalog, () => ({ at, ...found }))
+      await update($, catalog, current => ({ ...(current ?? emptyCatalog(at)), at, ...found }))
     })()
       .catch(() => undefined)
       .then(() => {
-        isCataloguing = false
+        isListingIgnored = false
       })
   })
 
   return true
+}
+
+let isIndexing = false
+let isIndexStale = false
+let indexedAt = 0
+
+/** Files came or went: the search's list is made again the next time the search reads it. */
+export const noteFilesChanged = () => {
+  isIndexStale = true
+}
+
+/**
+ * Makes the search's list off the drawing that searches: when there is none
+ * yet, files came or went since, or it is a minute old.
+ */
+export async function refreshIndex($: EngineInterface, base: string, status: GitStatus | null) {
+  if (isIndexing || base === '') return
+  isIndexing = true
+  // A clock that can't be read never leaves the list stuck as under way
+  const now = await $.clock.now().catch(() => indexedAt)
+  if (indexOf(base) !== undefined && !isIndexStale && now - indexedAt < CATALOG_STALE) {
+    isIndexing = false
+
+    return
+  }
+  isIndexStale = false
+  indexedAt = now
+  $.clock.after(0, () => {
+    void (async () => {
+      const { isSame, ...found } = await readIndex($, base, status)
+      if (isSame) return
+      const at = await $.clock.now()
+      await update($, catalog, current => ({ ...(current ?? emptyCatalog(at)), at, ...found }))
+    })()
+      .catch(() => undefined)
+      .then(() => {
+        isIndexing = false
+      })
+  })
 }
 
 // ---- Work kept off the tool path ----
@@ -343,7 +409,9 @@ export const hasScanned = () => hasAnswered
 
 /** The same files in the same states: a status that redraws nothing. */
 const isSameStatus = (a: GitStatus | null, b: GitStatus | null) =>
-  a === null || b === null ? a === b : a.top === b.top && JSON.stringify(a.files) === JSON.stringify(b.files)
+  a === null || b === null
+    ? a === b
+    : a.top === b.top && a.isFolded === b.isFolded && JSON.stringify(a.files) === JSON.stringify(b.files)
 
 /** Keeps `status` as git's last answer, unless it says what the one kept says. */
 async function keepStatus($: EngineInterface, status: GitStatus | null) {
@@ -351,9 +419,10 @@ async function keepStatus($: EngineInterface, status: GitStatus | null) {
 }
 
 // What the catalogue follows in a status: the files that came, went or moved,
-// not the ones only modified. A scan after each burst of commands lists the
-// project again only when they changed, or when the list is this old (an
-// ignore rule edited, a folder made that git ignores)
+// not the ones only modified. A scan after each burst of commands lists what
+// git ignores again only when they changed, or when the list is this old (an
+// ignore rule edited, a folder made that git ignores); the search's list, the
+// next time the search reads it
 const CATALOG_STALE = 60_000
 let catalogued: { shape: string; at: number } | undefined
 // The shape the last scan found: a new one means files came or went, and the tree lists its folders again
@@ -378,12 +447,15 @@ export async function runScan($: EngineInterface, withCounts?: boolean) {
   await keepStatus($, status)
   if (status !== null && turnId !== undefined) await markScanned($, status, turnId)
   const shape = shapeOf(status)
-  if (lastShape !== undefined && lastShape !== shape) forgetListings()
+  if (lastShape !== undefined && lastShape !== shape) {
+    forgetListings()
+    noteFilesChanged()
+  }
   lastShape = shape
   const now = await $.clock.now()
   const isDue = catalogued === undefined || catalogued.shape !== shape || now - catalogued.at >= CATALOG_STALE
   // A list already under way may predate this status: the next scan asks again
-  if (isDue && refreshCatalog($, status)) catalogued = { shape, at: now }
+  if (isDue && refreshIgnored($)) catalogued = { shape, at: now }
 }
 
 function startScan($: EngineInterface, withCounts?: boolean) {
@@ -397,11 +469,26 @@ function startScan($: EngineInterface, withCounts?: boolean) {
 }
 
 export function scheduleScan($: EngineInterface, ms = SCAN_DELAY) {
+  // Nobody sees the pane: the scan waits for its next drawing
+  if (!isPaneSeen()) {
+    owe()
+
+    return
+  }
   scanTimer?.cancel()
   scanTimer = $.clock.after(ms, () => {
     scanTimer = undefined
     startScan($)
   })
+}
+
+/**
+ * The pane is drawn: what waited while nobody saw it is done now, one scan
+ * for every command meanwhile; what git ignores is listed the first time.
+ */
+export function onDrawn($: EngineInterface) {
+  if (noteDrawn()) scheduleScan($, 0)
+  else if (!isIgnoredAsked) refreshIgnored($)
 }
 
 // How long a new turn waits for a scan under way. A command that rewrote

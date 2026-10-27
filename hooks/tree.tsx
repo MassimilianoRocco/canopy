@@ -55,8 +55,9 @@ export type TreeRow = {
 export type TreeProps = { gen: number; rows: TreeRow[]; sel?: number; note?: string; cut?: 1; from?: number }
 
 // `cursor` the row the keys move, by what it is (see idsOf), so a row drawn
-// above it moves it along; `hover` the one under the pointer, by its place
-type State = { cursor?: string | null; hover?: number | null }
+// above it moves it along; `hover` the one under the pointer, by its place;
+// `byKeys` while the keys put the cursor where it is, not a click
+type State = { cursor?: string | null; hover?: number | null; byKeys?: boolean }
 
 const COLOR: Partial<Record<Tone, string>> = {
   changed: 'suggestion',
@@ -64,8 +65,13 @@ const COLOR: Partial<Record<Tone, string>> = {
   untracked: 'warning',
   failed: 'error',
 }
-// The chrome around the names: chevrons, guides, a section's title
+// The chrome around the names: chevrons, a section's title
 const QUIET = 'subtle'
+// The indent guides, fainter still: the depth reads without a grid drawn over the tree
+const GUIDE = '#8080804d'
+// A folder never opened by itself (`node_modules`) or one git ignores, and what is in it:
+// a grey of its own, as a desktop's dim alone reads close to the names around it
+const HEAVY = '#8a8a8a'
 
 const isDim = (row: TreeRow) =>
   row.c === 'heavy' || row.c === 'deleted' || row.c === 'outside' || row.k === 'x'
@@ -80,9 +86,30 @@ const MATCH = '#e8a31747'
 
 const isActive = (row: TreeRow) => row.k === 'd' || row.k === 'f' || row.k === 'g'
 
-/** The counts as drawn: a side with nothing to count left out. */
-export const countsText = (s: readonly [number, number] | undefined) =>
-  s === undefined ? [] : [...(s[0] > 0 ? [`+${s[0]}`] : []), ...(s[1] > 0 ? [`−${s[1]}`] : [])]
+/** A file's lines added and removed, each as its column draws it: empty for nothing to count. */
+const sidesOf = (row: TreeRow): [string, string] =>
+  row.k !== 'f' || row.s === undefined ? ['', ''] : [row.s[0] > 0 ? `+${row.s[0]}` : '', row.s[1] > 0 ? `−${row.s[1]}` : '']
+
+/**
+ * The widths of the two count columns, the widest of each: every file's lines
+ * added stand under one another, its lines removed too, as an IDE's do.
+ */
+const widthsOf = (rows: readonly TreeRow[]) => {
+  let plus = 0
+  let minus = 0
+  for (const row of rows) {
+    const [added, removed] = sidesOf(row)
+    plus = Math.max(plus, added.length)
+    minus = Math.max(minus, removed.length)
+  }
+
+  return { plus, minus }
+}
+
+type Widths = ReturnType<typeof widthsOf>
+
+// The room the counts take at a row's end: each column and the space before it
+const countsRoom = (widths: Widths) => (widths.plus > 0 ? widths.plus + 1 : 0) + (widths.minus > 0 ? widths.minus + 1 : 0)
 
 // What stands before the name: a chevron and a space for what folds; two spaces
 // for a file in the tree, so its name stands under a folder's; nothing in a section
@@ -98,16 +125,16 @@ const BADGE_MIN_COLUMNS = 40
 const tintOf = (color: string) => `${color}24`
 const hasBadges = (columns: number) => columns <= 0 || columns >= BADGE_MIN_COLUMNS
 
-// The pointer's row is its `y` only while every row is one line: a row the
-// surface wrapped would shift every row below it. So a row is cut to the
-// region's width here, the dim words first (from their start, keeping a
-// path's end), then the name. Proportional glyphs run narrower than a cell
-// on average; the margin covers the wide ones.
+// The pointer's row is its `y` only while every row is one line, one cell
+// tall (see rowOf): a row the surface wrapped would shift every row below it.
+// So a row is cut to the region's width here, the dim words first (from their
+// start, keeping a path's end), then the name. Proportional glyphs run
+// narrower than a cell on average; the margin covers the wide ones.
 const ROOM = 0.9
 
-const fit = (row: TreeRow, columns: number): { t: string; n: string | undefined } => {
-  const counts = countsText(row.s).join(' ')
-  const right = (row.m === undefined ? 0 : row.m.length + 2) + (counts === '' ? 0 : counts.length + 2)
+const fit = (row: TreeRow, columns: number, widths: Widths): { t: string; n: string | undefined } => {
+  const hasCounts = sidesOf(row).some(side => side !== '')
+  const right = (row.m === undefined ? 0 : row.m.length + 2) + (hasCounts ? countsRoom(widths) + 1 : 0)
   const badge = row.k === 'f' && hasBadges(columns) ? BADGE_ROOM : 0
   const lead = (row.d ?? 0) * 2 + (row.i === 1 ? 2 : 0) + leadOf(row).length + badge + right
   const room = Math.floor(columns * ROOM) - 1 - lead
@@ -169,28 +196,33 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
   const isBadged = hasBadges(surface.columns)
   const state = surface.state ?? {}
   const ids = idsOf(rows)
+  const widths = widthsOf(rows)
   const set = (next: State) => surface.setState({ ...state, ...next })
 
   const rowOf = (row: TreeRow, at: number, cursor: number | null, hover: number | null): RenderElement => {
-    const { t, n } = fit(row, surface.columns)
+    const { t, n } = fit(row, surface.columns, widths)
     const active = isActive(row)
     const lit = active && at === hover
-    const tint = active && at === cursor ? SELECTED : lit ? HOVER : undefined
-    const counts = row.k === 'f' ? countsText(row.s) : []
-    const plus = counts.find(one => one.startsWith('+'))
-    const minus = counts.find(one => one.startsWith('−'))
+    // The cursor tinted where the keys put it; after a click, on a file alone, as an
+    // editor marks the file it shows: a heading or a folder clicked only folds
+    const isSelected = active && at === cursor && (row.k === 'f' || state.byKeys === true)
+    const tint = isSelected ? SELECTED : lit ? HOVER : undefined
+    const [plus, minus] = sidesOf(row)
+    const hasCounts = plus !== '' || minus !== ''
     const isHeading = row.k === 'g'
+    const isHeavy = row.c === 'heavy'
     const dim = isDim(row)
     // A heading's title is bold: what stands around it is not
     const plain = only(isHeading, 'bold', false)
     // The match, where the cut left it
     const [from, to] = row.h === undefined ? [0, 0] : [Math.min(row.h[0], t.length), Math.min(row.h[1], t.length)]
-    // What stands before the name is monospaced, guides, a section's indent and a chevron in one
-    // run: they take one width on every row, and the names start in one column
-    const lead = '│ '.repeat(row.d ?? 0) + (row.i === 1 ? '  ' : '') + leadOf(row)
-    const color = isHeading ? QUIET : COLOR[row.c]
+    // What stands before the name is monospaced, the guides, then a section's indent and a
+    // chevron: they take one width on every row, and the names start in one column
+    const guides = '│ '.repeat(row.d ?? 0)
+    const lead = (row.i === 1 ? '  ' : '') + leadOf(row)
+    const color = isHeading ? QUIET : isHeavy ? HEAVY : COLOR[row.c]
     const hasBadge = row.b !== undefined && row.b[0] !== ''
-    const hasRight = plus !== undefined || minus !== undefined || row.m !== undefined
+    const hasRight = hasCounts || row.m !== undefined
     // The name as drawn: in a Text of its own only where it is struck, lit or matched
     const isStyled = row.c === 'deleted' || lit || to > from
     const name =
@@ -204,18 +236,28 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
           ].filter(part => part !== '')
         : t
 
+    // One cell tall, whatever it holds: a badge's chip or a monospaced run draws a line a
+    // little taller than the cell the pointer's `y` counts in, and down a long list the
+    // rows would drift from the pointer, a click landing on the row below
     return (
       <Box
         key={String(at)}
+        height={1}
+        overflow="hidden"
         {...(hasRight ? { flexDirection: 'row' as const, justifyContent: 'space-between' as const } : {})}
         {...(tint === undefined ? {} : { backgroundColor: tint })}
       >
         <Text
           {...(color === undefined ? {} : { color })}
-          {...only(!isHeading && dim, 'dimColor', true)}
+          {...only(!isHeading && dim && !isHeavy, 'dimColor', true)}
           {...only(isHeading, 'bold', true)}
           wrap="truncate-end"
         >
+          {guides !== '' && (
+            <Text mono color={GUIDE} {...plain}>
+              {guides}
+            </Text>
+          )}
           {lead !== '' && (
             <Text mono color={QUIET} {...plain}>
               {lead}
@@ -250,15 +292,16 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
         </Text>
         {hasRight && (
           <Text>
-            {/* Digits of one width, so the counts stacked down the edge line up */}
-            {plus !== undefined && (
-              <Text tabular color="success" {...only(dim, 'dimColor', true)}>
-                {` ${plus}`}
+            {/* Two columns of one width each, monospaced: every file's lines added stand
+                under one another, its lines removed too, a side with none left blank */}
+            {hasCounts && widths.plus > 0 && (
+              <Text mono color="success" {...only(dim, 'dimColor', true)}>
+                {` ${plus.padStart(widths.plus)}`}
               </Text>
             )}
-            {minus !== undefined && (
-              <Text tabular color="error" {...only(dim, 'dimColor', true)}>
-                {` ${minus}`}
+            {hasCounts && widths.minus > 0 && (
+              <Text mono color="error" {...only(dim, 'dimColor', true)}>
+                {` ${minus.padStart(widths.minus)}`}
               </Text>
             )}
             {row.m !== undefined && (
@@ -314,7 +357,7 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
     const row = isDrawn(event.y) ? rows[event.y] : undefined
     const over = event.type !== 'leave' && row !== undefined && isActive(row) ? event.y : null
     if (event.type === 'down' && event.button === 'left' && over !== null) {
-      set({ cursor: ids[over] ?? null, hover: over })
+      set({ cursor: ids[over] ?? null, hover: over, byKeys: false })
       press(over)
     } else if (over !== hover) set({ hover: over })
   })
@@ -322,7 +365,7 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
   surface.onKey(event => {
     if (event.key === 'down' || event.key === 'up') {
       const at = step(cursor, event.key === 'down' ? 1 : -1)
-      if (at !== cursor && at !== null) set({ cursor: ids[at] ?? null })
+      if (at !== cursor && at !== null) set({ cursor: ids[at] ?? null, byKeys: true })
 
       return
     }

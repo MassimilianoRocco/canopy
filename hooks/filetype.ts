@@ -28,8 +28,9 @@ const BY_EXTENSION = new Map<string, Badge>([
   ['scss', ['SC', PURPLE]],
   ['sass', ['SA', PURPLE]],
   ['less', ['LE', PURPLE]],
-  ['html', ['HT', ORANGE]],
-  ['htm', ['HT', ORANGE]],
+  // A tag's brackets, as an IDE's icon for a page: read at a glance where two letters aren't
+  ['html', ['<>', ORANGE]],
+  ['htm', ['<>', ORANGE]],
   ['xml', ['XM', ORANGE]],
   ['svg', ['SV', ORANGE]],
   ['vue', ['VU', GREEN]],

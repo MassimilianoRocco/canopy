@@ -1,6 +1,7 @@
 import type { EngineInterface } from 'claude-code'
 
 import { hashOf, joinPath, splitLabel } from './paths'
+import { onPath, systemProgram } from './programs'
 
 /**
  * The editor a file goes to from the pane: a JetBrains IDE through its
@@ -39,15 +40,12 @@ function isThere($: EngineInterface, path: string) {
   return $.fs.exists(path).catch(() => false)
 }
 
-// A command on the PATH; on Windows the launcher itself, not the shell script beside it
+// A command in the PATH's folders, never the project's (programs.ts); on Windows the
+// launcher itself, not the shell script beside it
 async function which($: EngineInterface, name: string, isWindows: boolean) {
-  const out = await $.process
-    .run(isWindows ? ['where', name] : ['which', name], { timeoutMs: 3000 })
-    .catch(() => undefined)
-  if (out === undefined || out.exitCode !== 0) return undefined
-  const lines = out.stdout.split(/\r?\n/).map(line => line.trim()).filter(line => line !== '')
+  const found = await onPath($, name)
 
-  return isWindows ? lines.find(line => /\.(?:exe|cmd|bat)$/i.test(line)) : lines[0]
+  return isWindows ? found.find(line => /\.(?:exe|cmd|bat)$/i.test(line)) : found[0]
 }
 
 // The newest `<dir>/<prefix…>/<tail>` there is: one IDE folder per version
@@ -237,7 +235,7 @@ async function launch($: EngineInterface, editor: Editor, args: string[]): Promi
   // Through a script, cmd.exe would read `%…%` or `!…!` in a name as a variable: another file would open
   if (viaScript && args.some(arg => /[%!]/.test(arg))) return 'refused'
   const run = editor.isWindows
-    ? $.process.run(['powershell', '-NoProfile', '-NonInteractive', '-Command', viaScript ? `${START} -WindowStyle Hidden` : START], {
+    ? $.process.run([await systemProgram($, 'powershell'), '-NoProfile', '-NonInteractive', '-Command', viaScript ? `${START} -WindowStyle Hidden` : START], {
         env: { CANOPY_EXE: editor.exe, CANOPY_ARGS: args.map(quoteArg).join(' ') },
         timeoutMs: 15_000,
       })
@@ -257,6 +255,14 @@ export function compareIn($: EngineInterface, editor: Editor, left: string, righ
   return launch($, editor, editor.kind === 'vscode' ? ['--diff', left, right] : ['diff', left, right])
 }
 
+async function sidesFolder($: EngineInterface) {
+  return joinPath((await $.env.get('TEMP')) ?? (await $.env.get('TMPDIR')) ?? '/tmp', 'canopy')
+}
+
+// The copies this session's comparisons wrote: emptied as it ends, so a `.env`
+// compared leaves no secret in the temporary folder
+const sides = new Set<string>()
+
 /**
  * Writes one side of a comparison to the temporary folder, named after the
  * file and the side it stands for (`login (before the turn).ts`), so the
@@ -265,13 +271,39 @@ export function compareIn($: EngineInterface, editor: Editor, left: string, righ
  * here, and the folder holds three files at most for each file compared.
  */
 export async function writeSide($: EngineInterface, key: string, label: string, moment: string, text: string) {
-  const temp = (await $.env.get('TEMP')) ?? (await $.env.get('TMPDIR')) ?? '/tmp'
   const { name } = splitLabel(label)
   const dot = name.lastIndexOf('.')
   const stem = dot > 0 ? name.slice(0, dot) : name
   const extension = dot > 0 ? name.slice(dot) : ''
-  const path = joinPath(joinPath(joinPath(temp, 'canopy'), hashOf(key)), `${stem} (${moment})${extension}`)
+  const path = joinPath(joinPath(await sidesFolder($), hashOf(key)), `${stem} (${moment})${extension}`)
   await $.fs.write(path, text)
+  sides.add(path)
 
   return path
+}
+
+/** Empties the copies this session's comparisons wrote: nothing can delete them, an empty file stays. */
+export async function emptySides($: EngineInterface) {
+  for (const path of sides) await $.fs.write(path, '').catch(() => undefined)
+  sides.clear()
+}
+
+// A copy older than this was left by a session that never emptied its own (one
+// closed abruptly, a module reloaded); a newer one may be a comparison another
+// session still shows. The folders looked at as a session starts, at most
+const LEFT_AFTER = 24 * 60 * 60 * 1000
+const MAX_SWEPT = 500
+
+/** Empties the copies past sessions left in the temporary folder: off the startup path. */
+export async function sweepSides($: EngineInterface) {
+  const folder = await sidesFolder($)
+  const now = await $.clock.now()
+  const dirs = (await $.fs.list(folder).catch(() => [])).filter(entry => entry.kind === 'dir').slice(0, MAX_SWEPT)
+  for (const dir of dirs) {
+    const path = joinPath(folder, dir.name)
+    for (const entry of await $.fs.list(path).catch(() => [])) {
+      if (entry.kind !== 'file' || entry.size === 0 || now - entry.mtimeMs < LEFT_AFTER) continue
+      await $.fs.write(joinPath(path, entry.name), '').catch(() => undefined)
+    }
+  }
 }

@@ -9,8 +9,8 @@ import { HEAVY, HIDDEN, indexOf } from './git'
 import { listingOf } from './listing'
 import { TONE_COLOR, isDimTone, noteOf } from './model'
 import type { Change } from './model'
-import { isUnder, joinPath, keyOf, labelOf, pathIn, splitLabel, tidy } from './paths'
-import { refreshCatalog } from './scan'
+import { isUnder, joinPath, keyOf, labelOf, pathIn, shownOf, splitLabel } from './paths'
+import { refreshIndex } from './scan'
 import { search, treeOf } from './search'
 import type { Strings } from './text'
 import type { Tone, TreeRow } from './tree'
@@ -152,10 +152,10 @@ export async function renderLists($: EngineInterface, view: ListContext): Promis
     }
   }
 
-  // The search, over the catalogue: listed off this drawing when not there yet
+  // The search, over the catalogue: listed off this drawing when not there yet, or past its time
   const isSearching = text.trim() !== ''
+  if (isSearching) await refreshIndex($, base, status)
   const files = isSearching ? indexOf(base) : undefined
-  if (isSearching && files === undefined) refreshCatalog($, status)
   const matches = files === undefined ? [] : search(files, text)
   const results = treeOf(matches.slice(0, MAX_MATCHES), baseKey)
   // A folded project isn't walked: nothing of it is drawn
@@ -172,7 +172,7 @@ export async function renderLists($: EngineInterface, view: ListContext): Promis
   const markOf = (tone: Tone) => (tone === 'failed' ? '!' : undefined)
   // In a section: the folder, then what the colour says
   const folderOf = (one: Change) =>
-    [tidy(splitLabel(one.label).dir), one.word ?? ''].filter(part => part !== '').join(' · ')
+    [shownOf(splitLabel(one.label).dir), one.word ?? ''].filter(part => part !== '').join(' · ')
 
   // What the search says above its results
   const searchNote = !isSearching
@@ -186,7 +186,7 @@ export async function renderLists($: EngineInterface, view: ListContext): Promis
   // How long the search's first word is, marked where a found name holds it
   const matchLength = text.trim().split(/\s+/)[0]?.length ?? 0
 
-  const projectPath = tidy(labelOf(base, ''))
+  const projectPath = shownOf(base)
   const hasSections = changes.length > 0 || others.length > 0 || elsewhere.length > 0
   let isCut = rows.length >= MAX_ROWS
 

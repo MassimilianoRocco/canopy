@@ -46,9 +46,14 @@ the whole project under it, and what each turn touched marked on it.
   alone: the file as the turn found it beside the file now — side by side,
   editable, each block revertible from the editor. The older side is a copy in
   the temporary folder (`login (before the turn).ts`), written over at each
-  comparison rather than piled up.
+  comparison rather than piled up, and emptied as the session ends: a `.env`
+  compared leaves no secret behind. One a session closed abruptly left is
+  emptied a day on, as another session starts.
 - **Copy path** puts the file's path on the clipboard as a prompt takes it:
-  from the project's folder (`src/app/login.ts`), whole for a file outside it.
+  from the project's folder (`src/app/login.ts`), whole for a file outside it,
+  in the system's own separators (`C:\Temp\notes.txt` on Windows).
+- A prompt longer than its line opens whole with `▾` above the lists, and
+  closes again with `▴`.
 - What git ignores (`node_modules/`, `dist/`, `.env`) is dimmed and never opened
   by itself.
 - On a desktop: hover highlight, keyboard navigation (↑ ↓ Enter ← →) after a click
@@ -62,6 +67,23 @@ None in tokens: Canopy never calls the model and adds nothing to the context;
 burst of shell commands and once a turn has ended, never on a tool's path; every
 git call runs without optional locks, so it never takes `index.lock` from a
 commit running beside it.
+
+Git is asked only while the pane is drawn somewhere. A run nothing draws in
+(`claude -p`, the SDK, a desktop session no window shows), a terminal too narrow
+for the pane, a pane closed: Canopy keeps the list of what Claude's file tools
+change, and asks git nothing until the pane is drawn again, when one scan
+catches up. The search's list of the project's files is made the first time you
+search, and again while you do, once files came or went: never for a pane
+nobody searches in. The files a turn changed are read a few at a time as it
+ends, so the turn does not wait for them one by one.
+
+## Safety
+
+A repository can carry a program named like a tool (`git.exe`, `idea64.exe`)
+that Windows would find in the project's folder first. Canopy never starts one:
+on Windows it starts its own tools from the Windows folder (`where`, `reg`,
+PowerShell) and looks for git and the editors in the PATH's folders alone,
+never in the project's, then starts them by their full path.
 
 ## Install
 
@@ -122,6 +144,16 @@ Any JetBrains IDE works through its launcher (`webstorm64.exe`, `pycharm`…).
 - After a command, git is asked about the first 200 files it lists as changed:
   in a repository with more (a folder of untracked files, say), a change to a
   file further down that list goes unseen.
+- A repository with more than 2,000 files git neither tracks nor ignores (a
+  `venv/`, a `node_modules/` no `.gitignore` names), or whose `git status` takes
+  over a second, has git list each such folder whole from then on, for the
+  session, and the pane says so: a file a command makes inside a new folder is
+  shown as that folder. What Claude's file tools change is listed file by file
+  all the same.
+- While nobody sees the pane, what commands change is caught up for the latest
+  turn alone; earlier turns show what Claude's file tools changed.
+- Outside a repository the search walks the folder itself: 20,000 files and
+  2,000 folders at most.
 - A file changed by a command is attributed by time: written while one of
   Claude's commands ran is Claude's, anything else is an *other change*. A
   command left running in the background counts as running until its turn

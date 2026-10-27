@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { Register } from 'claude-code'
 
 import type { Lang, TouchedFile, TurnRecord } from '../types'
-import { findEditor, setEditor } from './editor'
+import { emptySides, findEditor, setEditor, sweepSides } from './editor'
 import type { EditorChoice } from './editor'
 import { rootOf, textOf } from './git'
 import { forgetListings } from './listing'
@@ -14,13 +14,16 @@ import {
   captureStart,
   countLater,
   keepText,
-  refreshCatalog,
+  noteFilesChanged,
+  onDrawn,
+  recountTexts,
   releaseTexts,
   scheduleScan,
   settleScan,
   stopScans,
 } from './scan'
 import { STRINGS, detectLang } from './text'
+import { noteOpened, noteUnseen } from './watch'
 
 const history = atom({ plugin: 'canopy', key: 'history' } as const, [])
 const shown = atom({ plugin: 'canopy', key: 'shown' } as const, null)
@@ -29,7 +32,7 @@ const opened = atom({ plugin: 'canopy', key: 'opened' } as const, null)
 const mode = atom({ plugin: 'canopy', key: 'mode' } as const, 'turn')
 const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
-const git = atom({ plugin: 'canopy', key: 'git' } as const, null)
+const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
 
 // What Canopy follows of a tool call: a file it edits or writes, or a command. What Claude
@@ -38,6 +41,12 @@ const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
 type Touch = { kind: 'edit' | 'write'; path: string } | { kind: 'command' }
 
 const SHELL_TOOLS = new Set(['Bash', 'PowerShell'])
+
+// The files a turn changed, read at once as it ends: the turn waits for the slowest of a few
+const READ_AT_ONCE = 4
+
+// A turn's prompt as kept, in characters
+const MAX_PROMPT = 2000
 
 const LANGS = new Set<string>(['en', 'it'])
 const EDITORS = new Set<string>(['auto', 'intellij', 'vscode', 'off'])
@@ -64,10 +73,18 @@ export const register: Register = (on, options) => {
     const base = await rootOf($)
     await update($, root, () => base)
     if (fixed !== undefined) await update($, lang, () => fixed)
-    void $.ui.open({ id: PANE, title: STRINGS[fixed ?? 'en'].title })
+    // Not placed (no surface yet, a narrow terminal), git waits for its first drawing
+    void $.ui
+      .open({ id: PANE, title: STRINGS[fixed ?? 'en'].title })
+      .then(noteOpened)
+      .catch(() => undefined)
 
-    // The language, the editor and the search's catalogue: found off the startup path
+    // The language and the editor: found off the startup path. The comparisons' copies a
+    // session closed abruptly left behind, emptied; the room the texts kept take, counted
+    // again after a reload
     $.clock.after(0, () => {
+      void sweepSides($).catch(() => undefined)
+      void recountTexts($).catch(() => undefined)
       void (async () => {
         if (fixed === undefined) {
           const found = await detectLang($).catch((): Lang => 'en')
@@ -80,7 +97,6 @@ export const register: Register = (on, options) => {
         setEditor(ide)
         await update($, editor, () => ide?.name ?? null)
       })().catch(() => undefined)
-      refreshCatalog($, null)
     })
 
     return next(e)
@@ -96,23 +112,47 @@ export const register: Register = (on, options) => {
   // The pane is the whole answer: no line for the model to read
   on('command.run', { command: 'canopy' }, async $ => {
     const s = STRINGS[fixed ?? (await read($, lang))]
-    await $.ui.open({ id: PANE, title: s.title })
+    noteOpened(await $.ui.open({ id: PANE, title: s.title }))
 
     return {}
+  })
+
+  // The pane closed: git waits for its next drawing
+  on('ui.close', ($, e, next) => {
+    if (e.id === PANE) noteUnseen()
+
+    return next(e)
+  })
+
+  // A window left: where no surface places the pane any more, git waits too
+  on('session.detach', ($, e, next) => {
+    if (e.reason !== 'end') {
+      void $.ui
+        .panes()
+        .then(panes => {
+          if (!panes.some(pane => pane.id === PANE && pane.isPlaced)) noteUnseen()
+        })
+        .catch(() => undefined)
+    }
+
+    return next(e)
   })
 
   on('session.end', async ($, e, next) => {
     stopScans()
     // A /clear or a /resume: the process goes on with another conversation, which has none of these turns
-    if (e.reason === 'clear' || e.reason === 'resume') {
-      // What the pane shows first, in a few writes: an end has one short bound for every
-      // plugin, and the texts, one write per file, may not all fit in it
-      const dropped = await read($, history)
+    const isOver = e.reason === 'clear' || e.reason === 'resume'
+    // What the pane shows first, in a few writes: an end has one short bound for every
+    // plugin, and the texts, one write per file, may not all fit in it
+    const dropped = isOver ? await read($, history) : []
+    if (isOver) {
       await update($, history, () => [])
       await update($, shown, () => null)
       await update($, opened, () => null)
-      await forget($, dropped)
     }
+    // The comparisons' copies, a few files at most: a secret kept no longer than the session
+    await emptySides($)
+    await forget($, dropped)
 
     return next(e)
   })
@@ -130,7 +170,8 @@ export const register: Register = (on, options) => {
       const turn: TurnRecord = {
         id: e.turnId,
         number: (list.at(-1)?.number ?? 0) + 1,
-        prompt: e.text.replace(/\s+/g, ' ').trim().slice(0, 200),
+        // Enough to read it whole in the pane, opened
+        prompt: e.text.replace(/\s+/g, ' ').trim().slice(0, MAX_PROMPT),
         startedAt,
         durationMs: null,
         endReason: null,
@@ -141,8 +182,9 @@ export const register: Register = (on, options) => {
 
       return [...list, turn].slice(-keep)
     })
-    // A new task brings the pane back to the latest turn
+    // A new task brings the pane back to the latest turn, its prompt on one line
     await update($, shown, () => null)
+    await update($, promptOpen, () => false)
     // What the files were as it began, kept off this path
     captureStart($, e.turnId)
 
@@ -165,13 +207,18 @@ export const register: Register = (on, options) => {
             : turn,
         ),
       )
-      // The texts as the turn left them, so an older turn's diff stays its own
+      // The texts as the turn left them, so an older turn's diff stays its own: read a few
+      // at a time, kept in the turn's order, so the room they take is counted as before
       const turn = (await read($, history)).find(one => one.id === e.turnId)
-      for (const file of turn?.files.filter(isClaude) ?? []) {
-        if (file.via !== undefined && file.edits === 0) continue
-        const after = keepText(e.turnId, await textOf($, file.path))
-        await update($, atom({ ...SNAPSHOT, id: `${e.turnId}|${file.key}` }, {}), current => ({ ...current, after }))
-        countLater($, e.turnId, file.key)
+      const files = (turn?.files.filter(isClaude) ?? []).filter(file => file.via === undefined || file.edits > 0)
+      for (let at = 0; at < files.length; at += READ_AT_ONCE) {
+        const batch = files.slice(at, at + READ_AT_ONCE)
+        const texts = await Promise.all(batch.map(file => textOf($, file.path)))
+        for (const [n, file] of batch.entries()) {
+          const after = keepText(e.turnId, texts[n]!)
+          await update($, atom({ ...SNAPSHOT, id: `${e.turnId}|${file.key}` }, {}), current => ({ ...current, after }))
+          countLater($, e.turnId, file.key)
+        }
       }
       // What changed without a file tool (a command, a hook, an editor): asked once the answer is out
       scheduleScan($, 0)
@@ -264,10 +311,11 @@ export const register: Register = (on, options) => {
     )
     // Its lines added and removed, counted off this path
     if (isDone) countLater($, turnId, seed.key)
-    // A new file joins the tree and the search's catalogue; the commit view follows a tool's edits too
+    // A new file joins the tree, and the search's catalogue the next time the search reads it;
+    // the commit view follows a tool's edits too
     if (isCreated) {
       forgetListings()
-      refreshCatalog($, await read($, git))
+      noteFilesChanged()
     }
     if ((await read($, mode)) === 'commit') scheduleScan($)
 
@@ -292,5 +340,10 @@ export const register: Register = (on, options) => {
     return next(e)
   })
 
-  on('ui.render', { component: 'Pane', requestId: 'canopy' }, ($, e) => renderPane($, e, fixed))
+  // Drawn, the pane is seen: what waited for it is done now
+  on('ui.render', { component: 'Pane', requestId: 'canopy' }, ($, e) => {
+    onDrawn($)
+
+    return renderPane($, e, fixed)
+  })
 }

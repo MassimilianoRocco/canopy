@@ -4,6 +4,8 @@ import type { Mounted, TestBody } from 'claude-code/testing'
 
 import { changesOf, diffLines, linesOf } from '../hooks/diff'
 import { quoteArg } from '../hooks/editor'
+import { nativeOf, shownOf } from '../hooks/paths'
+import type { TurnRecord } from '../types'
 
 const PANE = {
   plugin: 'canopy',
@@ -33,18 +35,26 @@ const IT = { options: { language: 'it' } }
 // ignores (a folder ends in `/`). Absent, the project is no repository.
 // `renamed` maps a staged rename's new path to its old one; `nested` is a
 // folder inside the project holding a repository of its own; `showDelay`, how
-// long each `git show` takes on the test's clock.
+// long each `git show` takes on the test's clock, and `statusDelay` each
+// `git status` listing every file git doesn't know.
 type Repo = {
   head: Record<string, string>
   ignored?: string[]
   renamed?: Record<string, string>
   nested?: string
   showDelay?: number
+  statusDelay?: number
 }
 
 const ran = (exitCode: number, stdout = '') => ({
   value: { exitCode, stdout, stderr: '', isStdoutTruncated: false, isStderrTruncated: false },
 })
+
+// The folders Windows' PATH names, in order: one inside the project, as a tool that
+// puts its own `bin` on the PATH leaves it, then git's and a folder of tools. Git is
+// installed there, off the project's disk
+const PATH_FOLDERS = ['C:\\proj\\bin', 'C:\\Program Files\\Git\\cmd', 'C:\\Tools']
+const GIT = 'C:\\Program Files\\Git\\cmd\\git.exe'
 
 // A project on a disk in memory, and the engine beneath the plugin. A Bash
 // command `write <path> <text>` stands in for any command that writes a file;
@@ -65,6 +75,8 @@ const project = (
   const processes = { count: 0 }
   // How many times the project's files were listed for the search
   const catalogs = { count: 0 }
+  // How long each read of a file takes on the test's clock, once a test sets it
+  const delays = { read: 0 }
   // An Edit on a held path waits: `isReached` once it is under way, `release` lets it end
   const gates = new Map<string, { reached: () => void; open: Promise<void> }>()
   const hold = (path: string) => {
@@ -80,13 +92,26 @@ const project = (
 
     return { isReached, release }
   }
-  // What the plugin started besides git, with the variables it set, and the files it wrote
+  // What the plugin started besides git, with the variables it set, and the files it wrote;
+  // every command it started, git's too
   const launched: { argv: string[]; env: Record<string, string> }[] = []
+  const argvs: string[][] = []
   const saved = new Map<string, string>()
   const norm = (path: string) => path.replace(/\//g, '\\')
   const isDir = (path: string) => [...disk.keys()].some(file => file.startsWith(path + '\\'))
   const relOf = (path: string) => path.slice('C:\\proj\\'.length).replace(/\\/g, '/')
   const isIgnored = (rel: string) => (repo?.ignored ?? []).some(one => rel === one || (one.endsWith('/') && rel.startsWith(one)))
+  // A file git doesn't know as `--untracked-files=normal` or `--directory` lists it: the first
+  // folder above it holding nothing git tracks, else the file itself
+  const foldedOf = (rel: string) => {
+    const parts = rel.split('/')
+    for (let depth = 1; depth < parts.length; depth++) {
+      const dir = `${parts.slice(0, depth).join('/')}/`
+      if (!Object.keys(repo?.head ?? {}).some(one => one.startsWith(dir))) return dir
+    }
+
+    return rel
+  }
 
   const clock = mock.clock(on, { now: 1_000_000 })
   // Each write at a moment of its own, as a disk's clock is finer than the test's
@@ -101,8 +126,9 @@ const project = (
   on('turn.start', (_, e) => ({ turnId: e.turnId }))
   on('turn.complete', (_, e) => ({ text: e.answer }))
   on('fs.exists', (_, e) => ({ value: disk.has(norm(e.path)) || isDir(norm(e.path)) }))
-  on('fs.read', (_, e) => {
+  on('fs.read', async (_, e) => {
     reads.count += 1
+    if (delays.read > 0) await clock.sleep(delays.read)
     const text = disk.get(norm(e.path))
 
     return text === undefined ? { deny: 'ENOENT' } : { value: text }
@@ -122,16 +148,37 @@ const project = (
   })
   on('process.run', async (_, e) => {
     processes.count += 1
-    const [command, ...rest] = e.argv
+    argvs.push([...e.argv])
+    const [command = '', ...rest] = e.argv
+    // A program by its name, or by its full path
+    const program = command.slice(Math.max(command.lastIndexOf('\\'), command.lastIndexOf('/')) + 1).toLowerCase()
     // An editor started detached: recorded, and it starts
-    if (command === 'powershell' || command === 'sh') {
+    if (program === 'powershell' || program === 'powershell.exe' || program === 'sh') {
       launched.push({ argv: [...e.argv], env: { ...e.init?.env } })
 
       return ran(0)
     }
+    // Windows' `where`: the files of that name in the PATH's folders, in its order, and
+    // without `$PATH:` in the folder it runs from first, as the real one looks
+    if (program === 'where.exe' || program === 'where') {
+      const [pattern = ''] = rest
+      const name = pattern.replace(/^\$PATH:/i, '').toLowerCase()
+      const folders = [...(pattern.startsWith('$PATH:') ? [] : [e.init?.cwd ?? cwd]), ...PATH_FOLDERS]
+      // `git` finds git.exe, git.cmd…, as PATHEXT has it
+      const isNamed = (file: string) => file.startsWith(name) && /^(?:\.(?:exe|cmd|bat|com))?$/.test(file.slice(name.length))
+      const found = folders.flatMap(folder =>
+        [...disk.keys(), GIT].filter(path => {
+          const at = path.lastIndexOf('\\')
+
+          return path.slice(0, at) === folder && isNamed(path.slice(at + 1).toLowerCase())
+        }),
+      )
+
+      return found.length === 0 ? ran(1) : ran(0, found.map(path => `${path}\r\n`).join(''))
+    }
     const isLockFree = rest[0] === '--no-optional-locks'
     const [verb, target] = isLockFree ? rest.slice(1) : rest
-    if (repo === undefined || command !== 'git') return ran(128)
+    if (repo === undefined || (program !== 'git' && program !== 'git.exe')) return ran(128)
     // Asked from wherever the session's cwd stands, a nested repository answers for itself
     if (verb === 'rev-parse') {
       const at = e.init?.cwd ?? cwd
@@ -144,12 +191,22 @@ const project = (
     const inProject = [...disk.keys()].filter(path => path.startsWith('C:\\proj\\'))
     if (verb === 'status') {
       scans.count += 1
+      const isFolded = rest.includes('--untracked-files=normal')
+      if (!isFolded && repo.statusDelay !== undefined) await clock.sleep(repo.statusDelay)
       const renamed = repo.renamed ?? {}
       const sources = new Set(Object.values(renamed))
-      const onDisk = inProject
-        .filter(path => repo.head[relOf(path)] !== disk.get(path) && !isIgnored(relOf(path)))
-        .filter(path => !(relOf(path) in renamed))
-        .map(path => `${relOf(path) in repo.head ? ' M' : '??'} ${relOf(path)}\0`)
+      const onDisk = [
+        ...new Set(
+          inProject
+            .filter(path => repo.head[relOf(path)] !== disk.get(path) && !isIgnored(relOf(path)))
+            .filter(path => !(relOf(path) in renamed))
+            .map(path => {
+              const rel = relOf(path)
+
+              return rel in repo.head ? ` M ${rel}\0` : `?? ${isFolded ? foldedOf(rel) : rel}\0`
+            }),
+        ),
+      ]
       // `-z` gives a rename as its new path, then its old one
       const moves = Object.entries(renamed).map(([to, from]) => `R  ${to}\0${from}\0`)
       const gone = Object.keys(repo.head)
@@ -181,9 +238,12 @@ const project = (
     if (verb === 'ls-files') {
       if (rest.includes('--ignored')) return ran(0, (repo.ignored ?? []).map(rel => `${rel}\0`).join(''))
       catalogs.count += 1
-      const listed = inProject.map(relOf).filter(rel => !isIgnored(rel))
+      const listed = inProject
+        .map(relOf)
+        .filter(rel => !isIgnored(rel))
+        .map(rel => (rest.includes('--directory') && !(rel in repo.head) ? foldedOf(rel) : rel))
 
-      return ran(0, listed.map(rel => `${rel}\0`).join(''))
+      return ran(0, [...new Set(listed)].map(rel => `${rel}\0`).join(''))
     }
     const committed = repo.head[String(target).replace(/^HEAD:/, '')]
     if (verb === 'show' && repo.showDelay !== undefined) await clock.sleep(repo.showDelay)
@@ -200,13 +260,18 @@ const project = (
       const [name, ...rest] = file.slice(dir.length + 1).split('\\')
       if (name !== undefined) names.set(name, rest.length > 0 ? 'dir' : 'file')
     }
-    const value: FsEntry[] = [...names].map(([name, kind]) => ({
-      name,
-      kind,
-      size: 0,
-      mtimeMs: 0,
-      isLink: false,
-    }))
+    // A file's own size and time, as the real listing gives them; a folder's 0
+    const value: FsEntry[] = [...names].map(([name, kind]) => {
+      const path = `${norm(e.path)}\\${name}`
+
+      return {
+        name,
+        kind,
+        size: kind === 'file' ? (disk.get(path)?.length ?? 0) : 0,
+        mtimeMs: kind === 'file' ? (writtenAt.get(path) ?? 0) : 0,
+        isLink: false,
+      }
+    })
 
     return { value }
   })
@@ -244,13 +309,14 @@ const project = (
     return { result: 'ok' }
   })
 
-  return { clock, scans, lists, reads, processes, catalogs, hold, touch, launched, saved }
+  return { clock, scans, lists, reads, processes, catalogs, hold, touch, launched, saved, argvs, delays }
 }
 
-// How an editor starts on Windows: Start-Process, the launcher and its arguments in variables
+// How an editor starts on Windows: Start-Process, the launcher and its arguments in variables,
+// Windows' own PowerShell by its full path (C:\Windows when no variable names the folder)
 const START = 'Start-Process -FilePath $env:CANOPY_EXE -ArgumentList $env:CANOPY_ARGS -ErrorAction Stop'
-const started = (exe: string, args: string) => ({
-  argv: ['powershell', '-NoProfile', '-NonInteractive', '-Command', START],
+const started = (exe: string, args: string, windows = 'C:\\Windows') => ({
+  argv: [`${windows}\\System32\\WindowsPowerShell\\v1.0\\powershell.exe`, '-NoProfile', '-NonInteractive', '-Command', START],
   env: { CANOPY_EXE: exe, CANOPY_ARGS: args },
 })
 
@@ -288,9 +354,11 @@ const listOf = (ui: Mounted<Surface, 'Pane'>, surface: Surface) => ({
 // A TypeScript file's badge, as the rows carry it
 const TS_BADGE = ['TS', '#4a8fe0']
 
-// The tinted row and the lit one, as tree.tsx paints them
+// The tinted row and the lit one, the indent guides and a heavy folder's grey, as tree.tsx paints them
 const SELECTED = '#4c8dff33'
 const HOVER = '#8080801f'
+const GUIDE = '#8080804d'
+const HEAVY = '#8a8a8a'
 
 test('the tree colours the files a turn changed and opens a folder that holds one', IT, async ($, on) => {
   const { clock } = project(on, {
@@ -358,15 +426,17 @@ test('a desktop draws its lists in a Client: coloured names, counts, quiet chrom
     { t: 'Modifiche', c: '', k: 'g', n: '1', o: 1 },
     { t: 'login.ts', c: 'changed', k: 'f', i: 1, n: 'src', b: TS_BADGE, s: [1, 1] },
     { t: ' ', c: '', k: 'x' },
-    { t: 'Progetto', c: '', k: 'g', n: 'C:/proj', o: 1 },
+    // The project's whole path in Windows' own separators
+    { t: 'Progetto', c: '', k: 'g', n: 'C:\\proj', o: 1 },
     { t: 'src', c: 'changed', k: 'd', m: '●', o: 1 },
     { t: 'login.ts', c: 'changed', k: 'f', d: 1, b: TS_BADGE, s: [1, 1] },
   ])
   // No Button among the rows: a native one would drop the colour
   expect(await ui.find({ key: 'file:c:/proj/src/login.ts' })).toBeUndefined()
   expect((await ui.find({ type: 'Text', text: '●' }))?.props.color).toBe('warning')
-  // The guide and the chevron quiet, the lines added and removed at the row's end
-  expect((await ui.find({ type: 'Text', text: /^│ {3}$/, in: 'tree' }))?.props.color).toBe('subtle')
+  // The guide fainter than the chevron, both quiet; the lines added and removed at the row's end
+  expect((await ui.find({ type: 'Text', text: /^│ $/, in: 'tree' }))?.props.color).toBe(GUIDE)
+  expect((await ui.find({ type: 'Text', text: /^ {2}$/, in: 'tree' }))?.props.color).toBe('subtle')
   expect((await ui.find({ type: 'Text', text: /^▾ $/, in: 'tree' }))?.props.color).toBe('subtle')
   expect((await ui.find({ type: 'Text', text: /^ \+1$/, in: 'tree' }))?.props.color).toBe('success')
   expect((await ui.find({ type: 'Text', text: /^ −1$/, in: 'tree' }))?.props.color).toBe('error')
@@ -461,6 +531,11 @@ test('the row under the pointer lights, and only an active one', IT, async ($, o
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   const rowBoxes = async () => (await ui.findAll({ type: 'Box', in: 'tree' })).slice(1)
   const name = () => ui.find({ type: 'Text', text: /^login\.ts$/, in: 'tree' })
+
+  // Every row one cell tall, a badge's chip and all: down a long list the row the pointer is
+  // over stays the one its `y` names, never drifting to the row below
+  expect((await rowBoxes()).length).toBeGreaterThan(2)
+  expect((await rowBoxes()).every(box => box.props.height === 1 && box.props.overflow === 'hidden')).toBe(true)
 
   await ui.pointer({ type: 'move', x: 3, y: 1, in: 'tree' })
   expect((await rowBoxes())[1]?.props.backgroundColor).toBe(HOVER)
@@ -840,7 +915,7 @@ test("the tree's root is the project, wherever a shell cd left the cwd", IT, asy
   await $.session.start({ cwd: 'C:\\proj\\src', surface: 'desktop', isInteractive: true })
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
-  expect(await ui.find({ type: 'Text', text: /^▾ Progetto · C:\/proj$/, in: 'tree' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^▾ Progetto · C:\\proj$/, in: 'tree' })).toBeDefined()
   expect(await ui.find({ type: 'Text', text: /README\.md/, in: 'tree' })).toBeDefined()
   await ui.unmount()
 })
@@ -899,6 +974,8 @@ test('the search finds files by every word, marks the match, and Enter opens the
   )
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  // Enter's button beside the field, in a word: the field keeps the row's room
+  expect((await ui.find({ key: 'search' }))?.props.submitLabel).toBe('Apri')
   await ui.input({ key: 'search', text: 'log', kind: 'change' })
   // The catalogue is listed off the drawing, once
   expect((await rowsOf(ui))[0]?.t).toBe('Indicizzo il progetto…')
@@ -980,6 +1057,11 @@ test('what git ignores is dimmed, never opened by itself', IT, async ($, on) => 
   expect(rows.find(row => row.t === 'logs' && row.k === 'd')?.c).toBe('heavy')
   expect(rows.find(row => row.t === '.env')?.c).toBe('heavy')
   expect(rows.find(row => row.t === 'src' && row.k === 'd')?.c).toBe('')
+  // Drawn in a grey of their own, not the desktop's light dim: they stand apart from the names around them
+  const logs = await ui.find({ type: 'Text', text: /logs$/, in: 'tree' })
+  expect(logs?.props.color).toBe(HEAVY)
+  expect(logs?.props.dimColor).toBeUndefined()
+  expect((await ui.find({ type: 'Text', text: /src$/, in: 'tree' }))?.props.color).toBeUndefined()
   await ui.unmount()
 })
 
@@ -1414,10 +1496,370 @@ test('a script whose program can’t be found is refused a name it would misread
   ])
 })
 
+// ---- What Canopy starts, and what it leaves in the temporary folder ----
+
+const WINDOWS = { OS: 'Windows_NT', SystemRoot: 'C:\\WINDOWS' }
+
+test('on Windows git is the PATH’s own, started by its full path: a git.exe the project holds never runs', IT, async ($, on) => {
+  const { clock, argvs } = project(
+    on,
+    // One beside the project's files, one in a folder of it the PATH names
+    { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\git.exe': '', 'C:\\proj\\bin\\git.exe': '' },
+    { head: { 'a.ts': 'x\n' } },
+  )
+  mock.env(on, WINDOWS)
+  sessionEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await clock.advance(400)
+  await $.turn.complete(done('t1'))
+  await clock.advance(300)
+
+  // git answered: the command's change is marked
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'chg:c:/proj/a.ts' })).toBeDefined()
+  await ui.unmount()
+
+  // Looked for once, in the PATH's folders alone, by Windows' own where; started by that path since
+  expect(argvs.filter(argv => argv[1] === '$PATH:git')).toEqual([['C:\\WINDOWS\\System32\\where.exe', '$PATH:git']])
+  const gits = argvs.filter(argv => /git(?:\.exe)?$/i.test(argv[0]!))
+  expect(gits.length).toBeGreaterThan(1)
+  expect(gits.every(argv => argv[0] === GIT)).toBe(true)
+  // Nothing started by its bare name, nor from the project
+  expect(argvs.every(argv => /^[A-Za-z]:\\/.test(argv[0]!) && !argv[0]!.toLowerCase().startsWith('c:\\proj\\'))).toBe(true)
+})
+
+test('on Windows the editor is looked for in the PATH alone: an idea64.exe the project holds is never the IDE', async ($, on) => {
+  const idea = 'C:\\Tools\\idea64.exe'
+  const { clock, launched, argvs } = project(on, {
+    'C:\\proj\\a.ts': 'x\n',
+    'C:\\proj\\idea64.exe': '',
+    'C:\\proj\\bin\\idea64.exe': '',
+    [idea]: '',
+  })
+  mock.env(on, WINDOWS)
+  sessionEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+  await $.turn.start({ text: 'change it', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'x', new_string: 'y' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'chg:c:/proj/a.ts' })
+  await ui.press({ key: 'editor:open' })
+  await ui.unmount()
+
+  expect(launched.at(-1)).toEqual(started(idea, '"--line" "1" "C:\\proj\\a.ts"', 'C:\\WINDOWS'))
+  // The language asked of Windows' own reg; nothing started from the project
+  expect(argvs.some(argv => argv[0] === 'C:\\WINDOWS\\System32\\reg.exe')).toBe(true)
+  expect(argvs.every(argv => !argv[0]!.toLowerCase().startsWith('c:\\proj\\'))).toBe(true)
+})
+
+test('a comparison’s copies are emptied as the session ends, and old ones an abrupt end left, as one starts', IT, async ($, on) => {
+  const idea = 'C:\\Users\\me\\AppData\\Local\\Programs\\IntelliJ IDEA Ultimate\\bin\\idea64.exe'
+  // Left by a session closed abruptly, a day before
+  const left = 'C:\\Temp\\canopy\\k1\\.env (prima del turno)'
+  // Written a moment ago by another session, whose comparison may still be open
+  const recent = 'C:\\Temp\\canopy\\k2\\b (prima del turno).ts'
+  const { clock, saved, touch } = project(on, { 'C:\\proj\\a.ts': 'one\n', [idea]: '', [left]: 'SECRET=1\n' })
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+  mock.env(on, { OS: 'Windows_NT', LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local', TEMP: 'C:\\Temp' })
+  sessionEngine(on)
+  await clock.advance(25 * 60 * 60 * 1000)
+  touch(recent, 'b\n')
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+  expect(saved.get(left)).toBe('')
+  expect(saved.has(recent)).toBe(false)
+
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'one', new_string: 'two' })
+  await $.turn.complete(done('t1'))
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'chg:c:/proj/a.ts' })
+  await ui.press({ key: 'editor:compare' })
+  await ui.unmount()
+  const side = [...saved.keys()].find(path => path.endsWith('a (prima del turno).ts'))!
+  expect(saved.get(side)).toBe('one\n')
+
+  await $.session.end({ reason: 'prompt_input_exit', sessionId: 's1', resume: { id: 's1' } })
+  expect(saved.get(side)).toBe('')
+})
+
+// ---- Work done for a pane someone sees, and kept light ----
+
+// The engine beneath a run nothing draws in: `claude -p`, the SDK, a desktop session no window shows
+const headlessEngine = (on: On) => {
+  on('command.register', (_, e) => ({ value: { command: e.name } }))
+  on('ui.open', () => ({ value: { isPlaced: false as const, reason: 'no-surface: no client is attached' } }))
+  on('session.start', (_, e) => ({ cwd: e.cwd }))
+}
+
+test('with no surface to draw the pane, git is asked nothing; drawn, one scan catches up', IT, async ($, on) => {
+  const { clock, scans, catalogs, argvs } = project(
+    on,
+    { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\b.ts': 'p\n' },
+    { head: { 'a.ts': 'x\n', 'b.ts': 'p\n' } },
+  )
+  headlessEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: null, isInteractive: false })
+  await clock.advance(1)
+
+  await $.turn.start({ text: 'sed', turnId: 't1' })
+  await clock.advance(1)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\b.ts', old_string: 'p', new_string: 'q' })
+  await clock.advance(400)
+  await $.turn.complete(done('t1'))
+  await clock.advance(1000)
+  expect(scans.count).toBe(0)
+  expect(catalogs.count).toBe(0)
+  expect(argvs.filter(argv => argv.includes('ls-files'))).toEqual([])
+
+  // A window shows it: one scan, and the command's change is marked beside the tool's
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(scans.count).toBe(1)
+  expect(await ui.find({ key: 'chg:c:/proj/a.ts' })).toBeDefined()
+  expect(await ui.find({ key: 'chg:c:/proj/b.ts' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a pane no window places any more asks git nothing; opened again with /canopy, one scan catches up', IT, async ($, on) => {
+  const { clock, scans } = project(on, { 'C:\\proj\\a.ts': 'x\n' }, { head: { 'a.ts': 'x\n' } })
+  sessionEngine(on)
+  on('session.detach', (_, e) => ({ clientId: e.clientId }))
+  // Once the window left, the pane stays open but is placed nowhere
+  on('ui.panes', () => ({
+    value: [{ id: 'canopy', title: 'Canopy', isShown: false, isFocused: false, isPlaced: false }],
+  }))
+  await $.session.start({ cwd: 'C:\\proj', surface: null, isInteractive: false })
+  await clock.advance(1)
+  await $.turn.start({ text: 'sed', turnId: 't1' })
+  await clock.advance(1)
+  const asked = scans.count
+
+  await $.session.detach({ surface: 'desktop', clientId: 'desktop:default', reason: 'detach' })
+  await clock.advance(1)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await clock.advance(400)
+  await $.turn.complete(done('t1'))
+  await clock.advance(1000)
+  expect(scans.count).toBe(asked)
+
+  await $.command.run({
+    command: 'canopy',
+    args: '',
+    origin: { kind: 'composer' },
+    presentation: { isFullscreen: false, columns: 80 },
+  })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(scans.count).toBe(asked + 1)
+  expect(await ui.find({ key: 'chg:c:/proj/a.ts' })).toBeDefined()
+  await ui.unmount()
+})
+
+const FOLDED = 'Molti file sconosciuti a git: una cartella nuova è elencata intera, non file per file.'
+
+test('a folder of thousands of files unknown to git is listed whole from then on, and the pane says so', IT, async ($, on) => {
+  const venv = Object.fromEntries(Array.from({ length: 2001 }, (_, n) => [`C:\\proj\\venv\\lib\\m${n}.py`, 'x\n']))
+  const { clock, argvs } = project(on, { 'C:\\proj\\a.ts': 'x\n', ...venv }, { head: { 'a.ts': 'x\n' } })
+  await $.turn.start({ text: 'installa', turnId: 't1' })
+  await clock.advance(1)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await clock.advance(400)
+  await clock.advance(300)
+
+  // Asked file by file once, then by folder for every status since
+  const statuses = argvs.filter(argv => argv.includes('status')).map(argv => argv.at(-1))
+  expect(statuses[0]).toBe('--untracked-files=all')
+  expect(statuses.length).toBeGreaterThan(2)
+  expect(statuses.slice(1).every(one => one === '--untracked-files=normal')).toBe(true)
+
+  // The command's change is marked all the same, and the pane says why a folder stands whole
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  expect(await ui.find({ key: 'chg:c:/proj/a.ts' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: FOLDED })).toBeDefined()
+  await ui.press({ key: 'mode:commit' })
+  await clock.advance(1)
+  expect(await ui.find({ key: 'chg:c:/proj/venv' })).toBeDefined()
+  expect(await ui.find({ key: 'chg:c:/proj/venv/lib/m0.py' })).toBeUndefined()
+  await ui.press({ key: 'chg:c:/proj/venv' })
+  expect(
+    await ui.find({ type: 'Text', text: 'Una cartella che git elenca intera: i suoi file non sono elencati uno per uno.' }),
+  ).toBeDefined()
+  await ui.unmount()
+})
+
+test('a git status slower than a second lists the folders git doesn’t know whole from then on', IT, async ($, on) => {
+  const { clock, argvs } = project(
+    on,
+    { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\data\\one.csv': '1\n' },
+    { head: { 'a.ts': 'x\n' }, statusDelay: 1500 },
+  )
+  await $.turn.start({ text: 'sed', turnId: 't1' })
+  await clock.advance(1600)
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
+  await clock.advance(400)
+  await clock.advance(300)
+
+  expect(argvs.filter(argv => argv.includes('status')).map(argv => argv.at(-1))).toEqual([
+    '--untracked-files=all',
+    '--untracked-files=normal',
+    '--untracked-files=normal',
+  ])
+})
+
+// Some two thousand folders listed one by one: seconds of the kit's own time
+test('outside a repository the search’s walk opens a bounded number of folders', { ...IT, timeoutMs: 30_000 }, async ($, on) => {
+  // Folders of one file each: the walk stops on the folders it opened, not on the files it found
+  const files = Object.fromEntries(Array.from({ length: 2500 }, (_, n) => [`C:\\proj\\d${n}\\f.txt`, 'x\n']))
+  const { clock, lists } = project(on, files)
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  await clock.advance(1)
+  const drawn = lists.count
+  await ui.input({ key: 'search', text: 'f.txt', kind: 'change' })
+  await clock.advance(1)
+  expect(lists.count - drawn).toBeLessThanOrEqual(2000)
+  await ui.unmount()
+})
+
+test('after a reload the room the kept texts take is counted again, not started over', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n' })
+  // What the session held as the module loaded again: four turns' texts, the whole room
+  const big = 'x'.repeat(3_000_000)
+  const held: TurnRecord[] = ['r1', 'r2', 'r3', 'r4'].map((id, n) => ({
+    id,
+    number: n + 1,
+    prompt: '',
+    startedAt: 0,
+    durationMs: 1000,
+    endReason: 'answer',
+    files: [
+      {
+        key: `c:/proj/f${n}.txt`,
+        path: `C:\\proj\\f${n}.txt`,
+        label: `f${n}.txt`,
+        edits: 1,
+        isCreated: false,
+        running: 0,
+        pending: null,
+        failures: 0,
+      },
+    ],
+    commands: 0,
+    runs: [],
+  }))
+  // Held beneath the module as the session's state: answered until the module writes its own
+  const preset = new Map<string, unknown>([['history', held]])
+  for (const turn of held) {
+    preset.set(`snapshot|${turn.id}|${turn.files[0]!.key}`, {
+      before: { kind: 'text', text: big },
+      after: { kind: 'text', text: big },
+    })
+  }
+  const nameOf = (e: { key: string; id?: string }) => (e.id === undefined ? e.key : `${e.key}|${e.id}`)
+  on('state.get', { plugin: 'canopy' }, (_, e, next) =>
+    preset.has(nameOf(e)) ? { value: { value: preset.get(nameOf(e)), version: 0 } } : next(e),
+  )
+  const kept = new Map<string, { before?: { kind: string } }>()
+  on('state.set', { plugin: 'canopy' }, (_, e, next) => {
+    preset.delete(nameOf(e))
+    if (e.key === 'snapshot' && e.id !== undefined) kept.set(e.id, e.value as { before?: { kind: string } })
+
+    return next(e)
+  })
+  sessionEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+
+  await $.turn.start({ text: 'cambia', turnId: 't5' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'x', new_string: 'y' })
+  expect(kept.get('t5|c:/proj/a.ts')?.before?.kind).toBe('too-large')
+})
+
+test('as a turn ends, the files it changed are read a few at a time, not one after another', IT, async ($, on) => {
+  const names = Array.from({ length: 8 }, (_, n) => `C:\\proj\\f${n}.ts`)
+  const { clock, delays } = project(on, Object.fromEntries(names.map(name => [name, 'x\n'])))
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  for (const name of names) await $.tool.call({ tool: 'Edit', file_path: name, old_string: 'x', new_string: 'y' })
+  await clock.advance(300)
+
+  // Each read takes a tenth of a second from here: eight one after another would take eight tenths
+  delays.read = 100
+  let isEnded = false
+  const ending = $.turn.complete(done('t1')).then(() => {
+    isEnded = true
+  })
+  await clock.advance(250)
+  expect(isEnded).toBe(true)
+  await ending
+})
+
+// ---- How the pane reads ----
+
+test('on a desktop the lines added and removed stand in two columns, a side with none left blank', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\b.ts': 'p\nq\n' })
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  // a.ts thirty lines added; b.ts two added and one removed
+  await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\a.ts', content: `x\n${'y\n'.repeat(30)}` })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\b.ts', old_string: 'q\n', new_string: 'r\ns\n' })
+  await clock.advance(300)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const counts = (await ui.findAll({ type: 'Text', in: 'tree' }))
+    .filter(text => text.props.mono === true && (text.props.color === 'success' || text.props.color === 'error'))
+    .map(text => text.text)
+  // Each column as wide as its widest: +30 over +2, the −1 under a blank where a.ts removed nothing
+  expect(counts.slice(0, 4)).toEqual([' +30', '   ', '  +2', ' −1'])
+  await ui.unmount()
+})
+
+test('a prompt longer than its line opens whole with a press, and closes again', IT, async ($, on) => {
+  project(on, { 'C:\\proj\\a.ts': 'x\n' })
+  // Some 480 characters: past the 200 an earlier version kept
+  const long = Array.from({ length: 60 }, (_, n) => `parola${n}`).join(' ')
+  await $.turn.start({ text: long, turnId: 't1' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const prompt = () => ui.find({ type: 'Text', text: /^parola0 / })
+  expect((await prompt())?.props.wrap).toBe('truncate-end')
+  await ui.press({ key: 'prompt' })
+  expect((await prompt())?.props.wrap).toBeUndefined()
+  expect((await prompt())?.text).toBe(long)
+  await ui.press({ key: 'prompt' })
+  expect((await prompt())?.props.wrap).toBe('truncate-end')
+
+  // Opened, a new turn's prompt starts on one line again; a short one has no button
+  await ui.press({ key: 'prompt' })
+  await $.turn.start({ text: long, turnId: 't2' })
+  expect((await prompt())?.props.wrap).toBe('truncate-end')
+  await $.turn.start({ text: 'breve', turnId: 't3' })
+  expect(await ui.find({ key: 'prompt' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('whole paths in their system’s separators: Windows’ backslashes, slashes everywhere else', () => {
+  expect(shownOf('C:\\progetti\\caremed')).toBe('C:\\progetti\\caremed')
+  expect(shownOf('C:/Users/me/AppData/Local/x')).toBe('~\\AppData\\Local\\x')
+  expect(shownOf('\\\\server\\share\\dir')).toBe('\\\\server\\share\\dir')
+  expect(shownOf('/home/me/projects/canopy')).toBe('~/projects/canopy')
+  expect(shownOf('/srv/app')).toBe('/srv/app')
+  // A path inside the project keeps its slashes, as a prompt takes it
+  expect(shownOf('src/app/consts')).toBe('src/app/consts')
+  expect(nativeOf('C:/Temp/notes.txt')).toBe('C:\\Temp\\notes.txt')
+  expect(nativeOf('/tmp/notes.txt')).toBe('/tmp/notes.txt')
+  expect(nativeOf('src/login.ts')).toBe('src/login.ts')
+})
+
 // ---- Badges ----
 
 test('each file wears its type’s badge, by extension or by name', IT, async ($, on) => {
-  const names = ['README.md', 'plugin.json', 'Dockerfile', '.gitignore', '.env.local', 'main.c', 'odd.constructor', 'NOTES']
+  const names = ['README.md', 'plugin.json', 'index.html', 'Dockerfile', '.gitignore', '.env.local', 'main.c', 'odd.constructor', 'NOTES']
   project(on, Object.fromEntries(names.map(name => [`C:\\proj\\${name}`, 'x\n'])))
 
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
@@ -1425,6 +1867,8 @@ test('each file wears its type’s badge, by extension or by name', IT, async ($
   expect(badges).toEqual({
     'README.md': ['MD', '#8a8a8a'],
     'plugin.json': ['{}', '#e07b39'],
+    // A page by a tag's brackets, as an IDE's icon reads
+    'index.html': ['<>', '#e07b39'],
     Dockerfile: ['DK', '#4a8fe0'],
     '.gitignore': ['GI', '#e07b39'],
     '.env.local': ['EN', '#c9a227'],
@@ -1481,7 +1925,7 @@ test('on a desktop the room before a name is monospaced, so the names start in o
   const texts = await ui.findAll({ type: 'Text', in: 'tree' })
   const one = (pattern: RegExp) => texts.find(text => pattern.test(text.text))
   // A guide, a chevron, a section's indent, a file's lead and its badge: one width each, whatever the letters
-  expect(one(/^│ {3}$/)?.props.mono).toBe(true)
+  expect(one(/^│ $/)?.props.mono).toBe(true)
   expect(one(/^▾ $/)?.props.mono).toBe(true)
   expect(texts.filter(text => text.text === '  ').every(text => text.props.mono === true)).toBe(true)
   // A badge is monospaced, its letters between two small spaces: the same width for every badge
@@ -1491,9 +1935,9 @@ test('on a desktop the room before a name is monospaced, so the names start in o
   const blank = texts.find(text => text.text === '    ' && text.props.size === 'caption')
   expect(blank).toBeDefined()
   expect(blank?.props.backgroundColor).toBeUndefined()
-  // The counts' digits are of one width
-  expect(one(/^ \+1$/)?.props.tabular).toBe(true)
-  expect(one(/^ −1$/)?.props.tabular).toBe(true)
+  // The counts monospaced, so their columns line up
+  expect(one(/^ \+1$/)?.props.mono).toBe(true)
+  expect(one(/^ −1$/)?.props.mono).toBe(true)
   await ui.unmount()
 })
 
@@ -1527,7 +1971,7 @@ test('what a turn wrote outside the project waits in its own folded section, out
       await ui.press({ key: 'section:elsewhere' })
     }
     // Opened: the file, where it is, and what was written
-    expect(await list.row(/C:\/Temp\/scratch · nuovo/)).toBeDefined()
+    expect(await list.row(/C:\\Temp\\scratch · nuovo/)).toBeDefined()
     await list.click('chg:c:/temp/scratch/notes.txt', 'notes.txt')
     expect((await ui.find({ type: 'Code' }))?.props.source).toBe('@@ -0,0 +1,2 @@\n+uno\n+due')
     await ui.press({ key: 'back' })
@@ -1608,7 +2052,11 @@ test('a selected row stays selected while rows are drawn above it', IT, async ($
     (await ui.findAll({ type: 'Box', in: 'tree' }))
       .filter(box => box.props.backgroundColor === SELECTED)
       .map(box => box.text.trim())
+  // A click on a folder opens it and tints nothing: the tint marks a file, or where the keys are
   await ui.pointer({ type: 'down', x: 1, y: (await rowsOf(ui)).findIndex(row => row.t === 'docs'), button: 'left', in: 'tree' })
+  expect(await tinted()).toEqual([])
+  await ui.key({ key: 'up', in: 'tree' })
+  await ui.key({ key: 'down', in: 'tree' })
   expect(await tinted()).toEqual(['▾ docs'])
 
   // Claude changes a file: its section is drawn above the tree, and every row moves down
@@ -1659,7 +2107,7 @@ test('a slow scan never holds the next prompt, and still marks the turn it began
   await ui.unmount()
 })
 
-test('scans that find the same files list the project no more, and draw nothing again', IT, async ($, on) => {
+test('the search’s list is made only once the search is used, and again while it is, once files came', IT, async ($, on) => {
   const { clock, catalogs } = project(on, { 'C:\\proj\\a.ts': 'x\n' }, { head: { 'a.ts': 'x\n' } })
   // What git's answer and the catalogue are written as, while the commands run
   const written: string[] = []
@@ -1673,34 +2121,42 @@ test('scans that find the same files list the project no more, and draw nothing 
   await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\a.ts y\n' })
   await clock.advance(400)
   await clock.advance(300)
-  const listed = catalogs.count
   written.length = 0
 
-  // Commands that change nothing more: git asked each time, the same answer, no list and no write
+  // Commands that change nothing more: git asked each time, the same answer, nothing written
   for (let n = 0; n < 3; n++) {
     await $.tool.call({ tool: 'Bash', command: 'ls' })
     await clock.advance(400)
     await clock.advance(300)
   }
-  expect(catalogs.count).toBe(listed)
   expect(written.filter(key => key === 'git' || key === 'catalog')).toEqual([])
 
-  // A file made: listed again, and the search finds it
+  // Files made while nobody searches: the project is never listed for the search
   await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\b.ts z\n' })
   await clock.advance(400)
   await clock.advance(300)
-  expect(catalogs.count).toBe(listed + 1)
+  expect(catalogs.count).toBe(0)
+
+  // The search used: listed once, and it finds what was made
   const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
   await ui.input({ key: 'search', text: 'b.ts', kind: 'change' })
+  await clock.advance(1)
   expect((await rowsOf(ui)).map(row => row.t)).toEqual(['1 file', 'b.ts'])
-  await ui.unmount()
+  await ui.input({ key: 'search', text: '.ts', kind: 'change' })
+  await clock.advance(1)
+  expect(catalogs.count).toBe(1)
 
-  // And, a minute on, once more whatever git says: an ignore rule may have changed
-  await clock.advance(60_000)
-  await $.tool.call({ tool: 'Bash', command: 'ls' })
+  // A file made: listed again the next time the search reads its list, and found
+  await ui.input({ key: 'search', text: '', kind: 'change' })
+  await $.tool.call({ tool: 'Bash', command: 'write C:\\proj\\c.ts w\n' })
   await clock.advance(400)
   await clock.advance(300)
-  expect(catalogs.count).toBe(listed + 2)
+  expect(catalogs.count).toBe(1)
+  await ui.input({ key: 'search', text: 'c.ts', kind: 'change' })
+  await clock.advance(1)
+  expect(catalogs.count).toBe(2)
+  expect((await rowsOf(ui)).map(row => row.t)).toEqual(['1 file', 'c.ts'])
+  await ui.unmount()
 })
 
 test('the texts a turn keeps for its diffs are bounded: past the room, a file is too large to show', IT, async ($, on) => {
@@ -1995,12 +2451,13 @@ test('a file’s view copies its path as a prompt takes it, and says so', IT, as
     await ui.unmount()
   }
 
-  // A file outside the project: its whole path. And a clipboard that refused: said so
+  // A file outside the project: its whole path, in Windows' own separators. And a clipboard that refused: said so
   const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
   await ui.press({ key: 'section:elsewhere' })
   await ui.press({ key: 'chg:c:/temp/notes.txt' })
   await ui.press({ key: 'copy:path' })
-  expect(copied.at(-1)?.text).toBe('C:/Temp/notes.txt')
+  expect(copied.at(-1)?.text).toBe('C:\\Temp\\notes.txt')
+  expect(toasts.at(-1)).toBe('Copiato: C:\\Temp\\notes.txt')
   isRefused = true
   await ui.press({ key: 'copy:path' })
   expect(toasts.at(-1)).toBe('Non riesco a copiare il percorso qui.')
