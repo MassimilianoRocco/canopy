@@ -579,7 +579,7 @@ test('a narrow pane cuts every row to one line, the path from its start', IT, as
   await ui.unmount()
 })
 
-test('a file opens whole with the changes coloured, or only its changes', IT, async ($, on) => {
+test('a changed file opens on its changes, whole a press away, the choice kept', IT, async ($, on) => {
   const before = Array.from({ length: 20 }, (_, at) => `l${at + 1}`).join('\n') + '\n'
   project(on, { 'C:\\proj\\src\\login.ts': before })
 
@@ -596,9 +596,10 @@ test('a file opens whole with the changes coloured, or only its changes', IT, as
     const ui = await $.ui.mount({ ...PANE, surface })
     await listOf(ui, surface).click('chg:c:/proj/src/login.ts', 'login.ts')
 
+    // Its changes first, the lines around each: what the turn did, with nothing to scroll past
     const code = await ui.find({ type: 'Code' })
     expect(code?.props.format).toBe('diff')
-    expect(String(code?.props.source).startsWith('@@ -1,20 +1,20 @@\n l1\n')).toBe(true)
+    expect(code?.props.source).toBe('@@ -7,7 +7,7 @@\n l7\n l8\n l9\n-l10\n+L10\n l11\n l12\n l13')
     expect((await ui.find({ type: 'Text', text: '+1' }))?.props.color).toBe('success')
     expect((await ui.find({ type: 'Text', text: '−1' }))?.props.color).toBe('error')
     expect(await ui.find({ type: 'Text', text: /righe 10 · dal turno/ })).toBeDefined()
@@ -607,14 +608,20 @@ test('a file opens whole with the changes coloured, or only its changes', IT, as
     // The prompt gives its line to the code
     expect(await ui.find({ type: 'Text', text: /cambia l10/ })).toBeUndefined()
 
-    await ui.press({ key: 'view:hunks' })
-    expect((await ui.find({ type: 'Code' }))?.props.source).toBe(
-      '@@ -7,7 +7,7 @@\n l7\n l8\n l9\n-l10\n+L10\n l11\n l12\n l13',
-    )
+    // The whole file, its changes coloured
     await ui.press({ key: 'view:full' })
+    expect(String((await ui.find({ type: 'Code' }))?.props.source).startsWith('@@ -1,20 +1,20 @@\n l1\n')).toBe(true)
 
+    // Back to the tree by a press, or by its key while the pane holds the keys; opened
+    // again, the file is drawn whole, as last chosen
+    expect((await ui.find({ key: 'back' }))?.props.hotkey).toBe('a')
+    expect(await ui.find({ type: 'Text', text: 'o premi A nel pannello' })).toBeDefined()
     await ui.press({ key: 'back' })
     expect(await ui.find({ type: 'Code' })).toBeUndefined()
+    await listOf(ui, surface).click('chg:c:/proj/src/login.ts', 'login.ts')
+    expect(String((await ui.find({ type: 'Code' }))?.props.source).startsWith('@@ -1,20 +1,20 @@\n l1\n')).toBe(true)
+    await ui.press({ key: 'view:hunks' })
+    await ui.press({ key: 'back' })
     await ui.unmount()
   }
 })
@@ -959,6 +966,11 @@ test('the pane speaks English unless told otherwise', async ($, on) => {
   expect((await rowsOf(ui)).filter(row => row.k === 'g').map(row => row.t)).toEqual(['Changes', 'Project'])
   expect((await ui.find({ key: 'mode:commit' }))?.text).toBe('Commit')
   expect((await ui.find({ key: 'search' }))?.props.placeholder).toBe('Search files…')
+  // A file's way back to the tree, and its key, in the label's own letter
+  await ui.pointer({ type: 'down', x: 1, y: 1, button: 'left', in: 'tree' })
+  expect((await ui.find({ key: 'back' }))?.text).toBe('◀ Tree')
+  expect((await ui.find({ key: 'back' }))?.props.hotkey).toBe('t')
+  expect(await ui.find({ type: 'Text', text: 'or press T in the pane' })).toBeDefined()
   await ui.unmount()
 })
 

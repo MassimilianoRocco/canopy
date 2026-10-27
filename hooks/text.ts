@@ -73,6 +73,9 @@ const en = {
 
   // The file view
   back: '◀ Tree',
+  // The key that presses it while the pane holds the keys: the label's own first letter
+  backKey: 't',
+  backHint: (key: string) => `or press ${key.toUpperCase()} in the pane`,
   emptyFile: 'Empty file.',
   tooLarge: 'Too large or unreadable to show here.',
   gone: 'The file no longer exists.',
@@ -171,6 +174,8 @@ const it: Strings = {
   stateConflict: 'conflitto',
 
   back: '◀ Albero',
+  backKey: 'a',
+  backHint: key => `o premi ${key.toUpperCase()} nel pannello`,
   emptyFile: 'File vuoto.',
   tooLarge: 'File troppo grande o illeggibile per mostrarlo qui.',
   gone: 'Il file non esiste più.',

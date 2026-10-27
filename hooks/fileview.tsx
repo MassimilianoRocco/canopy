@@ -13,7 +13,9 @@ import type { Change } from './model'
 import { keyOf, nativeOf, splitLabel, tidy } from './paths'
 import type { Strings } from './text'
 
-const diffView = atom({ plugin: 'canopy', key: 'diffView' } as const, 'full')
+// A changed file opens on its changes, the lines around each: what the turn did, read without
+// scrolling the whole file. The whole file is a press away, and stays chosen once pressed
+const diffView = atom({ plugin: 'canopy', key: 'diffView' } as const, 'hunks')
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
 
 // The code one file view draws: the engine draws a tree's first 100,000
@@ -283,7 +285,14 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
     <Box flexDirection="column">
       {header}
       <Box flexDirection="row" justifyContent="space-between" gap={1} marginTop={1}>
-        <Button key="back" label={s.back} onPress={open(null)} />
+        {/* Its letter goes back to the tree from anywhere in the file, the pane holding the
+            keys: said beside it, on one line that gives way to the arrows */}
+        <Box flexDirection="row" gap={1} flexShrink={1}>
+          <Button key="back" label={s.back} hotkey={s.backKey} onPress={open(null)} />
+          <Text dimColor size="footnote" wrap="truncate-end">
+            {s.backHint(s.backKey)}
+          </Text>
+        </Box>
         {at !== -1 && pool.length > 1 && prev !== undefined && next !== undefined && (
           <Box flexDirection="row" gap={1}>
             <Button key="chg:prev" label="‹" onPress={openChange(prev)} />

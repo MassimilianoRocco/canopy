@@ -107,6 +107,7 @@ declare module 'claude-code' {
       /** Per `<turnId>|<file key>`: the texts a turn's diff is drawn from. */
       snapshot: StateFamily<Snapshot>
       mode: Mode
+      /** How a changed file opens: its changes (the default) or whole, as last pressed. */
       diffView: DiffView
       /** Null before the first scan, or outside a repository. */
       git: GitStatus | null

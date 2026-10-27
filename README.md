@@ -29,9 +29,11 @@ the whole project under it, and what each turn touched marked on it.
 - **Outside the project**, folded too: what Claude wrote beyond the project's
   folder (a scratch file, a setting in your home folder), worth a look but
   kept out of the project's summary.
-- **The diff of a turn**, not just against the last commit: the whole file with
-  its changes coloured, or only the changes, block by block. The last ten turns
-  stay one click away.
+- **The diff of a turn**, not just against the last commit: only the changes,
+  block by block, as a changed file opens, or the whole file with its changes
+  coloured, a press away and kept once chosen. The last ten turns stay one
+  click away. Back to the tree with `◀`, or its key (`A`, `T` in English)
+  while the pane holds the keys.
 - **Since the last commit**, as a second view, for the whole picture.
 
 ## Working with it
