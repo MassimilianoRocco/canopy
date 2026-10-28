@@ -120,6 +120,8 @@ declare module 'claude-code' {
       editor: string | null
       /** Whether the shown turn's prompt is drawn whole rather than on one line. */
       isPromptOpen: boolean
+      /** Whether the list of turns stands in place of the lists, to pick one. */
+      isTurnsOpen: boolean
     }
   }
 }

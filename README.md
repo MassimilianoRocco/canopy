@@ -31,9 +31,11 @@ the whole project under it, and what each turn touched marked on it.
   kept out of the project's summary.
 - **The diff of a turn**, not just against the last commit: only the changes,
   block by block, as a changed file opens, or the whole file with its changes
-  coloured, a press away and kept once chosen. The last ten turns stay one
-  click away. Back to the tree with `◀`, or its key (`A`, `T` in English)
-  while the pane holds the keys.
+  coloured, a press away and kept once chosen. Back to the tree with `◀`, or
+  its key (`A`, `T` in English) while the pane holds the keys.
+- **The last ten turns** one click away: the turn's name opens the list of
+  them, latest first, each with its state's dot, its files and its prompt, to
+  pick one by what it was asked; `‹ ›` step through them one by one.
 - **Since the last commit**, as a second view, for the whole picture.
 
 ## Working with it

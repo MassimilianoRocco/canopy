@@ -615,7 +615,10 @@ test('a changed file opens on its changes, whole a press away, the choice kept',
     // Back to the tree by a press, or by its key while the pane holds the keys; opened
     // again, the file is drawn whole, as last chosen
     expect((await ui.find({ key: 'back' }))?.props.hotkey).toBe('a')
-    expect(await ui.find({ type: 'Text', text: 'o premi A nel pannello' })).toBeDefined()
+    // A desktop marks the key on the button itself; the terminal says it beside
+    const hint = await ui.find({ type: 'Text', text: 'o premi A nel pannello' })
+    if (surface === 'terminal') expect(hint).toBeDefined()
+    else expect(hint).toBeUndefined()
     await ui.press({ key: 'back' })
     expect(await ui.find({ type: 'Code' })).toBeUndefined()
     await listOf(ui, surface).click('chg:c:/proj/src/login.ts', 'login.ts')
@@ -970,7 +973,8 @@ test('the pane speaks English unless told otherwise', async ($, on) => {
   await ui.pointer({ type: 'down', x: 1, y: 1, button: 'left', in: 'tree' })
   expect((await ui.find({ key: 'back' }))?.text).toBe('◀ Tree')
   expect((await ui.find({ key: 'back' }))?.props.hotkey).toBe('t')
-  expect(await ui.find({ type: 'Text', text: 'or press T in the pane' })).toBeDefined()
+  // Marked on the button by the desktop itself: no words beside it there
+  expect(await ui.find({ type: 'Text', text: 'or press T in the pane' })).toBeUndefined()
   await ui.unmount()
 })
 
@@ -1852,6 +1856,99 @@ test('a prompt longer than its line opens whole with a press, and closes again',
   expect((await prompt())?.props.wrap).toBe('truncate-end')
   await $.turn.start({ text: 'breve', turnId: 't3' })
   expect(await ui.find({ key: 'prompt' })).toBeUndefined()
+  await ui.unmount()
+})
+
+test('a new file’s view counts what it has, and offers no comparison with nothing', IT, async ($, on) => {
+  const idea = 'C:\\Users\\me\\AppData\\Local\\Programs\\IntelliJ IDEA Ultimate\\bin\\idea64.exe'
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n', [idea]: '' })
+  mock.env(on, { OS: 'Windows_NT', LOCALAPPDATA: 'C:\\Users\\me\\AppData\\Local', TEMP: 'C:\\Temp' })
+  sessionEngine(on)
+  await $.session.start({ cwd: 'C:\\proj', surface: 'terminal', isInteractive: true })
+  await clock.advance(1)
+  await $.turn.start({ text: 'cambia', turnId: 't1' })
+  await $.tool.call({ tool: 'Write', file_path: 'C:\\proj\\new.ts', content: 'uno\ndue\n' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'x', new_string: 'y' })
+  await $.turn.complete(done('t1'))
+  await clock.advance(300)
+
+  // Its lines added, no −0 beside them; opened in the editor, not compared with an empty file
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'chg:c:/proj/new.ts' })
+  expect(await ui.find({ type: 'Text', text: '+2' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /^−\d+$/ })).toBeUndefined()
+  expect(await ui.find({ key: 'editor:open' })).toBeDefined()
+  expect(await ui.find({ key: 'editor:compare' })).toBeUndefined()
+
+  // A file the turn changed: compared as before
+  await ui.press({ key: 'back' })
+  await ui.press({ key: 'chg:c:/proj/a.ts' })
+  expect(await ui.find({ key: 'editor:compare' })).toBeDefined()
+  await ui.unmount()
+})
+
+// Three turns: two done, the latest still running
+const threeTurns = async ($: Parameters<TestBody>[0]) => {
+  await $.turn.start({ text: 'primo giro', turnId: 't1' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\a.ts', old_string: 'x', new_string: 'y' })
+  await $.turn.complete(done('t1'))
+  await $.turn.start({ text: 'secondo giro', turnId: 't2' })
+  await $.tool.call({ tool: 'Edit', file_path: 'C:\\proj\\b.ts', old_string: 'p', new_string: 'q' })
+  await $.turn.complete(done('t2'))
+  await $.turn.start({ text: 'terzo giro', turnId: 't3' })
+}
+
+test('the turn’s name opens the turns kept, the latest first; one picked is shown', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\b.ts': 'p\n' })
+  await threeTurns($)
+  await clock.advance(300)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'desktop' })
+  const rowBoxes = async () => (await ui.findAll({ type: 'Box', in: 'tree' })).slice(1)
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 3 ▾')
+
+  // Each turn by its dot, its files and its prompt; the latest says it is the current one, and is tinted
+  await ui.press({ key: 'turns' })
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 3 ▴')
+  expect(await rowsOf(ui)).toEqual([
+    { t: 'Turno 3', c: '', k: 't', n: 'in corso… · 0 file · terzo giro', u: 'warning', m: 'attuale' },
+    { t: 'Turno 2', c: '', k: 't', n: '1 file · secondo giro', u: 'success' },
+    { t: 'Turno 1', c: '', k: 't', n: '1 file · primo giro', u: 'success' },
+  ])
+  expect((await rowBoxes())[0]?.props.backgroundColor).toBe(SELECTED)
+
+  // Picked: the list closes on that turn's files
+  await ui.pointer({ type: 'down', x: 1, y: 2, button: 'left', in: 'tree' })
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 1 ▾')
+  expect(await ui.find({ type: 'Text', text: '1/3' })).toBeDefined()
+  expect((await rowsOf(ui)).some(row => row.t === 'a.ts' && row.i === 1)).toBe(true)
+
+  // Opened again, the one shown is tinted; the latest picked follows the turns to come
+  await ui.press({ key: 'turns' })
+  expect((await rowBoxes())[2]?.props.backgroundColor).toBe(SELECTED)
+  await ui.pointer({ type: 'down', x: 1, y: 0, button: 'left', in: 'tree' })
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 3 ▾')
+
+  // A new turn closes the list and is shown
+  await ui.press({ key: 'turns' })
+  await $.turn.start({ text: 'quarto giro', turnId: 't4' })
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 4 ▾')
+  expect((await rowsOf(ui)).some(row => row.k === 't')).toBe(false)
+  await ui.unmount()
+})
+
+test('on the terminal the turns kept are buttons, the one shown in bold', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'x\n', 'C:\\proj\\b.ts': 'p\n' })
+  await threeTurns($)
+  await clock.advance(300)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await ui.press({ key: 'turns' })
+  expect((await ui.find({ type: 'Text', text: 'Turno 3' }))?.props.bold).toBe(true)
+  expect(await ui.find({ type: 'Text', text: 'attuale' })).toBeDefined()
+  await ui.press({ key: 'turn:2' })
+  expect((await ui.find({ key: 'turns' }))?.text).toBe('Turno 2 ▾')
+  expect(await ui.find({ key: 'chg:c:/proj/b.ts' })).toBeDefined()
   await ui.unmount()
 })
 

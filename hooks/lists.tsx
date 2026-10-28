@@ -1,13 +1,13 @@
 import { atom, read, update } from 'claude-code'
 import type { EngineInterface, RenderElement } from 'claude-code'
 
-import type { GitStatus, Mode, OpenedFile, TouchedFile } from '../types'
-import { openFile, remember, reveal, selected } from './actions'
+import type { GitStatus, Mode, OpenedFile, TouchedFile, TurnRecord } from '../types'
+import { openFile, pickTurn, remember, reveal, selected } from './actions'
 import type { Target } from './actions'
 import { BADGE_MIN_COLUMNS, fileBadgeOf } from './filetype'
 import { HEAVY, HIDDEN, indexOf } from './git'
 import { listingOf } from './listing'
-import { TONE_COLOR, isDimTone, noteOf } from './model'
+import { TONE_COLOR, isClaude, isDimTone, noteOf, statusColorOf } from './model'
 import type { Change } from './model'
 import { isUnder, joinPath, keyOf, labelOf, pathIn, shownOf, splitLabel } from './paths'
 import { refreshIndex } from './scan'
@@ -71,6 +71,89 @@ export type ListContext = {
   status: GitStatus | null
   /** What the search field holds. */
   text: string
+  /** The turns kept, to pick one in place of the lists: the one shown by id, null for the latest. */
+  turns?: { list: readonly TurnRecord[]; shownId: string | null }
+}
+
+// A turn's prompt as its row carries it: the rest is cut where the row ends anyway
+const TURN_PROMPT = 160
+
+/**
+ * The turns kept, the latest first, to pick one: each with its dot in its
+ * state's colour, how many files it changed and its prompt, the latest marked.
+ * Picking the latest follows the turns to come.
+ */
+function renderTurns(
+  $: EngineInterface,
+  view: ListContext,
+  turns: NonNullable<ListContext['turns']>,
+): { lists: RenderElement; isCut: boolean } {
+  const { Box, Text, Button } = view.elements
+  const { Client, s } = view
+  const latest = turns.list.at(-1)
+  const entries = [...turns.list].reverse().map(turn => {
+    const isLatest = turn === latest
+    const words = [
+      ...(turn.durationMs === null ? [s.running] : []),
+      s.files(turn.files.filter(isClaude).length),
+      turn.prompt.slice(0, TURN_PROMPT),
+    ].filter(word => word !== '')
+
+    return {
+      turn,
+      isLatest,
+      isShown: isLatest ? turns.shownId === null : turn.id === turns.shownId,
+      words: words.join(' · '),
+      target: { kind: 'turn' as const, id: isLatest ? null : turn.id },
+    }
+  })
+
+  if (Client !== undefined) {
+    const targets: Target[] = entries.map(entry => entry.target)
+    const rows: TreeRow[] = entries.map(entry => ({
+      t: s.turn(entry.turn.number),
+      c: '',
+      k: 't',
+      n: entry.words,
+      u: statusColorOf(entry.turn),
+      ...(entry.isLatest ? { m: s.current } : {}),
+    }))
+    const sel = entries.findIndex(entry => entry.isShown)
+
+    return {
+      lists: (
+        <Box flexDirection="column" marginTop={1}>
+          <Client
+            key="tree"
+            module="./tree.tsx"
+            props={{ gen: remember(targets), rows, ...(sel === -1 ? {} : { sel }), note: s.cut }}
+            width="100%"
+          />
+        </Box>
+      ),
+      isCut: false,
+    }
+  }
+
+  return {
+    lists: (
+      <Box flexDirection="column" marginTop={1}>
+        {entries.map(entry => (
+          <Box key={`turn:${entry.turn.number}`} flexDirection="row" gap={1}>
+            <Text color={statusColorOf(entry.turn)}>●</Text>
+            <Button key={`turn:${entry.turn.number}`} plain onPress={() => pickTurn($, entry.target.id)}>
+              <Text {...(entry.isShown ? { bold: true } : {})}>{s.turn(entry.turn.number)}</Text>
+            </Button>
+            <Text dimColor wrap="truncate-end">
+              {entry.words}
+            </Text>
+            {entry.isLatest && <Text dimColor>{s.current}</Text>}
+          </Box>
+        ))}
+      </Box>
+    ),
+    isCut: false,
+  }
 }
 
 /**
@@ -79,6 +162,7 @@ export type ListContext = {
  * the list was cut short, for the terminal to say so.
  */
 export async function renderLists($: EngineInterface, view: ListContext): Promise<{ lists: RenderElement; isCut: boolean }> {
+  if (view.turns !== undefined) return renderTurns($, view, view.turns)
   const { Box, Text, Button } = view.elements
   const { Client, s, how, base, touched, changes, others, elsewhere, byKey, status, text } = view
   const baseKey = keyOf(base)

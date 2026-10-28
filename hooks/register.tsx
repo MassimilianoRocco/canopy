@@ -33,6 +33,7 @@ const mode = atom({ plugin: 'canopy', key: 'mode' } as const, 'turn')
 const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
 const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
+const turnsOpen = atom({ plugin: 'canopy', key: 'isTurnsOpen' } as const, false)
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
 
 // What Canopy follows of a tool call: a file it edits or writes, or a command. What Claude
@@ -182,9 +183,10 @@ export const register: Register = (on, options) => {
 
       return [...list, turn].slice(-keep)
     })
-    // A new task brings the pane back to the latest turn, its prompt on one line
+    // A new task brings the pane back to the latest turn, its prompt on one line, its files listed
     await update($, shown, () => null)
     await update($, promptOpen, () => false)
+    await update($, turnsOpen, () => false)
     // What the files were as it began, kept off this path
     captureStart($, e.turnId)
 

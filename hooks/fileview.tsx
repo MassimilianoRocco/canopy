@@ -29,6 +29,8 @@ type Table = ReturnType<EngineInterface['ui']['resolve']>
 /** What the file view is drawn from: the pane's reading of the moment. */
 export type FileContext = {
   elements: Table
+  /** Where it is drawn: what a desktop marks by itself, the terminal says in words. */
+  surface: string
   s: Strings
   file: OpenedFile
   how: Mode
@@ -190,10 +192,11 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
       // Past the drawing's room the whole file would be cut and lose its colours: its changes it is
       const isWholeTooLarge = lines.reduce((size, line) => size + line.text.length + 2, 0) > MAX_CODE
       if (isWholeTooLarge) note = s.wholeTooLarge
+      // A side with nothing to count left out, as the lists leave it: no `−0` under a new file
       stats = (
         <Box flexDirection="row" gap={1}>
-          <Text color="success">+{counts.added}</Text>
-          <Text color="error">−{counts.removed}</Text>
+          {counts.added > 0 && <Text color="success">+{counts.added}</Text>}
+          {counts.removed > 0 && <Text color="error">−{counts.removed}</Text>}
           <Text dimColor size="footnote">
             · {s.lines(rangesText(counts.ranges))} · {since}
           </Text>
@@ -273,7 +276,8 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
   )
   const prev = pool[(at - 1 + pool.length) % pool.length]
   const next = pool[(at + 1) % pool.length]
-  const canCompare = before !== undefined && before.kind !== 'too-large' && after.kind === 'text'
+  // Against a text it had: a new file beside an empty one would only show it all added
+  const canCompare = before?.kind === 'text' && after.kind === 'text'
   // The path as a prompt takes it: from the project's folder, else whole, in its system's separators
   const copyPath = async (press: { surface?: Parameters<typeof $.ui.copy>[0]['surface'] }) => {
     const text = nativeOf(file.label)
@@ -286,12 +290,15 @@ export async function renderFile($: EngineInterface, view: FileContext): Promise
       {header}
       <Box flexDirection="row" justifyContent="space-between" gap={1} marginTop={1}>
         {/* Its letter goes back to the tree from anywhere in the file, the pane holding the
-            keys: said beside it, on one line that gives way to the arrows */}
+            keys. A desktop marks it on the button itself; the terminal says it beside, on
+            one line that gives way to the arrows */}
         <Box flexDirection="row" gap={1} flexShrink={1}>
           <Button key="back" label={s.back} hotkey={s.backKey} onPress={open(null)} />
-          <Text dimColor size="footnote" wrap="truncate-end">
-            {s.backHint(s.backKey)}
-          </Text>
+          {view.surface === 'terminal' && (
+            <Text dimColor size="footnote" wrap="truncate-end">
+              {s.backHint(s.backKey)}
+            </Text>
+          )}
         </Box>
         {at !== -1 && pool.length > 1 && prev !== undefined && next !== undefined && (
           <Box flexDirection="row" gap={1}>

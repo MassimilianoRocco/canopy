@@ -2,7 +2,7 @@ import { atom, read, update } from 'claude-code'
 import type { EngineInterface } from 'claude-code'
 
 import type { Lang, Mode, TurnRecord } from '../types'
-import { faultOn, openFile } from './actions'
+import { faultOn, openFile, toggleTurns } from './actions'
 import { currentEditor } from './editor'
 import { releaseFileView, renderFile } from './fileview'
 import { indexOf, rootOf } from './git'
@@ -27,6 +27,7 @@ const query = atom({ plugin: 'canopy', key: 'query' } as const, '')
 const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
 const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
+const turnsOpen = atom({ plugin: 'canopy', key: 'isTurnsOpen' } as const, false)
 
 const primaryIf = (isOn: boolean) => (isOn ? { variant: 'primary' as const } : {})
 
@@ -133,6 +134,10 @@ export async function renderPane(
   const promptRoom = Math.floor((typeof columns === 'number' ? columns : 60) * 0.9) - 3
   const isPromptLong = turn !== undefined && turn.prompt.length > promptRoom
 
+  // With more than one turn kept, the turn's name opens the list of them, to pick one by
+  // what it was asked; the arrows step through them one by one
+  const isTurnsOpen = list.length > 1 && (await read($, turnsOpen))
+
   const header =
     turn === undefined ? (
       <Text dimColor>{s.noTurn}</Text>
@@ -141,7 +146,15 @@ export async function renderPane(
         <Box flexDirection="row" justifyContent="space-between" gap={1}>
           <Box flexDirection="row" gap={1}>
             <Text color={statusColorOf(turn)}>●</Text>
-            <Text bold>{s.turn(turn.number)}</Text>
+            {list.length > 1 ? (
+              <Button key="turns" plain onPress={() => toggleTurns($)}>
+                <Text bold>
+                  {s.turn(turn.number)} {isTurnsOpen ? '▴' : '▾'}
+                </Text>
+              </Button>
+            ) : (
+              <Text bold>{s.turn(turn.number)}</Text>
+            )}
             <Text dimColor>· {turnStatusOf(s, turn)}</Text>
           </Box>
           {list.length > 1 && (
@@ -176,10 +189,40 @@ export async function renderPane(
       </Box>
     )
 
+  // ---- The turns kept, to pick one: in place of the lists, under the same header ----
+  if (isTurnsOpen) {
+    releaseFileView()
+    const { lists } = await renderLists($, {
+      elements,
+      Client,
+      columns: typeof columns === 'number' ? columns : undefined,
+      scroll: undefined,
+      s,
+      how,
+      base,
+      touched,
+      changes: [],
+      others: [],
+      elsewhere: [],
+      byKey: new Map(),
+      status,
+      text: '',
+      turns: { list, shownId: index === list.length - 1 ? null : (list[index]?.id ?? null) },
+    })
+
+    return (
+      <Box flexDirection="column">
+        {header}
+        {lists}
+      </Box>
+    )
+  }
+
   // ---- One file, its changes coloured ----
   if (file !== null) {
     return renderFile($, {
       elements,
+      surface: e.surface,
       s,
       file,
       how,

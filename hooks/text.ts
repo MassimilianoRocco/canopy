@@ -11,6 +11,8 @@ const en = {
   noTurn: 'No turns yet: as Claude works, the files it touches light up here.',
   turn: (n: number) => `Turn ${n}`,
   running: 'running…',
+  // The latest turn in the list of turns, the one the pane follows
+  current: 'current',
   interrupted: (took: string) => `interrupted after ${took}`,
   failedIn: (took: string) => `ended with an error in ${took}`,
   // A turn that ended well: its time says it
@@ -121,6 +123,7 @@ const it: Strings = {
   noTurn: 'Ancora nessun turno: quando Claude lavora, i file che tocca si colorano qui.',
   turn: n => `Turno ${n}`,
   running: 'in corso…',
+  current: 'attuale',
   interrupted: took => `interrotto dopo ${took}`,
   failedIn: took => `finito con errore in ${took}`,
   finishedIn: took => took,

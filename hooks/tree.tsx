@@ -22,17 +22,19 @@ export type TreeRow = {
   /** How it reads. */
   c: Tone
   /**
-   * `d` folder, `f` file, `g` a section heading that folds: a click answers.
-   * `x` a dim note: nothing does.
+   * `d` folder, `f` file, `g` a section heading that folds, `t` a turn to
+   * pick: a click answers. `x` a dim note: nothing does.
    */
-  k: 'd' | 'f' | 'g' | 'x'
+  k: 'd' | 'f' | 'g' | 'x' | 't'
+  /** A turn's dot, in the colour of how it went (running, done, failed). */
+  u?: string
   /** Indent guides before it: the tree's depth. */
   d?: number
   /** One plain indent step, no guide: a section's row. */
   i?: 1
   /** Dim words after the name: its folder, `new`, `read`, a section's count. */
   n?: string
-  /** At the right edge: ● for a folder holding a change, ! for a refused edit. */
+  /** At the right edge: ● for a folder holding a change, ! for a refused edit; a turn's dim word. */
   m?: string
   /** At the right edge: the lines added and removed. */
   s?: [number, number]
@@ -84,7 +86,7 @@ const HOVER = '#8080801f'
 const SELECTED = '#4c8dff33'
 const MATCH = '#e8a31747'
 
-const isActive = (row: TreeRow) => row.k === 'd' || row.k === 'f' || row.k === 'g'
+const isActive = (row: TreeRow) => row.k === 'd' || row.k === 'f' || row.k === 'g' || row.k === 't'
 
 /** A file's lines added and removed, each as its column draws it: empty for nothing to count. */
 const sidesOf = (row: TreeRow): [string, string] =>
@@ -136,15 +138,18 @@ const fit = (row: TreeRow, columns: number, widths: Widths): { t: string; n: str
   const hasCounts = sidesOf(row).some(side => side !== '')
   const right = (row.m === undefined ? 0 : row.m.length + 2) + (hasCounts ? countsRoom(widths) + 1 : 0)
   const badge = row.k === 'f' && hasBadges(columns) ? BADGE_ROOM : 0
-  const lead = (row.d ?? 0) * 2 + (row.i === 1 ? 2 : 0) + leadOf(row).length + badge + right
+  // A turn's dot and the space after it
+  const dot = row.k === 't' ? 2 : 0
+  const lead = (row.d ?? 0) * 2 + (row.i === 1 ? 2 : 0) + leadOf(row).length + badge + dot + right
   const room = Math.floor(columns * ROOM) - 1 - lead
   let { t, n } = row
   const gap = row.k === 'g' ? 3 : 2
   if (columns <= 0 || t.length + (n === undefined ? 0 : n.length + gap) <= room) return { t, n }
 
+  // A path keeps its end, where the file's folder is; a turn's words their start, its prompt's
   if (n !== undefined) {
     const left = room - t.length - gap
-    n = left >= 8 ? `…${n.slice(n.length - left + 1)}` : undefined
+    n = left < 8 ? undefined : row.k === 't' ? `${n.slice(0, left - 1)}…` : `…${n.slice(n.length - left + 1)}`
   }
   if (t.length > room) t = `${t.slice(0, Math.max(1, room - 1))}…`
 
@@ -205,7 +210,7 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
     const lit = active && at === hover
     // The cursor tinted where the keys put it; after a click, on a file alone, as an
     // editor marks the file it shows: a heading or a folder clicked only folds
-    const isSelected = active && at === cursor && (row.k === 'f' || state.byKeys === true)
+    const isSelected = active && at === cursor && (row.k === 'f' || row.k === 't' || state.byKeys === true)
     const tint = isSelected ? SELECTED : lit ? HOVER : undefined
     const [plus, minus] = sidesOf(row)
     const hasCounts = plus !== '' || minus !== ''
@@ -277,6 +282,8 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
             </Text>
           )}
           {isBadged && row.k === 'f' && ' '}
+          {/* A turn's dot, in the colour of how it went, as the pane's header draws it */}
+          {row.k === 't' && <Text {...(row.u === undefined ? {} : { color: row.u })}>● </Text>}
           {isStyled ? (
             <Text {...only(row.c === 'deleted', 'strikethrough', true)} {...only(lit, 'underline', true)}>
               {name}
@@ -304,11 +311,14 @@ const Tree: ClientModule<TreeProps, State> = (props, surface) => {
                 {` ${minus.padStart(widths.minus)}`}
               </Text>
             )}
-            {row.m !== undefined && (
-              <Text bold color={row.m === '●' ? COLOR.changed : COLOR.failed}>
-                {` ${row.m}`}
-              </Text>
-            )}{' '}
+            {row.m !== undefined &&
+              (row.k === 't' ? (
+                <Text dimColor>{` ${row.m}`}</Text>
+              ) : (
+                <Text bold color={row.m === '●' ? COLOR.changed : COLOR.failed}>
+                  {` ${row.m}`}
+                </Text>
+              ))}{' '}
           </Text>
         )}
       </Box>
