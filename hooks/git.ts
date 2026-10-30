@@ -1,6 +1,6 @@
 import type { EngineInterface } from 'claude-code'
 
-import type { FileText, GitFile, GitStatus } from '../types'
+import type { FileText, GitFile, GitStatus, LocalCommit, Pushing } from '../types'
 import { isUnder, joinPath, keyOf, labelOf } from './paths'
 import { gitOf } from './programs'
 
@@ -108,14 +108,72 @@ let untracked: 'all' | 'normal' = 'all'
 /** Whether git lists the folders it doesn't know whole, not file by file. */
 export const isFolded = () => untracked === 'normal'
 
+// With the branch first: `## main...origin/main [ahead 2]`
 function statusOf($: Git, top: string) {
-  return git($, top, ['status', '--porcelain=v1', '-z', `--untracked-files=${untracked}`])
+  return git($, top, ['status', '--porcelain=v1', '-z', '--branch', `--untracked-files=${untracked}`])
+}
+
+/** The branch a status names, its upstream (null for none), and how many commits it is ahead of it. */
+type Branch = { name: string; upstream: string | null; ahead: number }
+
+/**
+ * The branch from the line `status --branch` puts first: `main`,
+ * `main...origin/main [ahead 2, behind 1]`. Null on a detached HEAD
+ * (`HEAD (no branch)`) or before the first commit (`No commits yet on main`):
+ * a branch's name holds no space, nor the `...` before its upstream.
+ */
+export function branchOf(line: string): Branch | null {
+  const body = line.slice(3)
+  const at = body.indexOf('...')
+  const name = at === -1 ? body : body.slice(0, at)
+  if (name === '' || name.includes(' ')) return null
+  const track = at === -1 ? null : /^(\S+)(?: \[([^\]]*)\])?$/.exec(body.slice(at + 3))
+  // An upstream deleted since (`[gone]`) is as good as none
+  if (track === null || track[2] === 'gone') return { name, upstream: null, ahead: 0 }
+
+  return { name, upstream: track[1]!, ahead: Number(/ahead (\d+)/.exec(track[2] ?? '')?.[1] ?? 0) }
+}
+
+// The commits not pushed that the commit view names: the latest few
+const MAX_LISTED_COMMITS = 5
+
+async function commitsOf($: EngineInterface, top: string, range: readonly string[]): Promise<LocalCommit[]> {
+  const out = await git($, top, ['log', '-z', '--format=%h%x09%s', `--max-count=${MAX_LISTED_COMMITS}`, ...range])
+  if (out === undefined || out.exitCode !== 0) return []
+
+  return splitZ(out.stdout).map(entry => {
+    const at = entry.indexOf('\t')
+
+    return { hash: entry.slice(0, at), subject: entry.slice(at + 1, at + 1 + 200) }
+  })
+}
+
+/**
+ * The commits of `branch` no remote has: from git's own count against the
+ * upstream, the list asked only when there is one; with no upstream (a branch
+ * never pushed as itself), the commits on none of the remotes. Undefined in a
+ * repository with no remote, where there is nothing to push to.
+ */
+async function readPushing($: EngineInterface, top: string, branch: Branch): Promise<Pushing | undefined> {
+  if (branch.upstream !== null) {
+    const commits = branch.ahead === 0 ? [] : await commitsOf($, top, ['@{upstream}..HEAD'])
+
+    return { branch: branch.name, count: branch.ahead, commits }
+  }
+  const remote = await git($, top, ['for-each-ref', '--count=1', '--format=%(refname)', 'refs/remotes'])
+  if (remote === undefined || remote.exitCode !== 0 || remote.stdout.trim() === '') return undefined
+  const counted = await git($, top, ['rev-list', '--count', 'HEAD', '--not', '--remotes'])
+  const count = counted?.exitCode === 0 ? Number(counted.stdout.trim()) || 0 : 0
+  const commits = count === 0 ? [] : await commitsOf($, top, ['HEAD', '--not', '--remotes'])
+
+  return { branch: branch.name, count, commits }
 }
 
 /**
  * One `git status`; null outside a repository or where git can't run. With
- * `withCounts`, each tracked file's lines added and removed since the last
- * commit too: one `git diff --numstat` more.
+ * `withCounts`, what the commit view draws besides: each tracked file's lines
+ * added and removed since the last commit (one `git diff --numstat` more), and
+ * the branch's commits no remote has (one `git log` more, where there are some).
  */
 export async function readGit($: EngineInterface, withCounts = false): Promise<GitStatus | null> {
   const top = await topOf($)
@@ -137,6 +195,7 @@ export async function readGit($: EngineInterface, withCounts = false): Promise<G
   const files: GitFile[] = []
   const fields = out.stdout.split('\0')
   if (out.isStdoutTruncated) fields.pop()
+  const branch = fields[0]?.startsWith('## ') === true ? branchOf(fields.shift()!) : null
   for (let at = 0; at < fields.length && files.length < MAX_GIT_FILES; at++) {
     const field = fields[at]!
     if (field.length < 4) continue
@@ -145,6 +204,7 @@ export async function readGit($: EngineInterface, withCounts = false): Promise<G
     files.push({ rel: field.slice(3), code: codeOf(xy), ...(from === undefined || from === '' ? {} : { from }) })
   }
   const counts = withCounts && files.length > 0 ? await readCounts($, top) : undefined
+  const pushing = withCounts && branch !== null ? await readPushing($, top, branch) : undefined
 
   return {
     at: await $.clock.now(),
@@ -155,6 +215,7 @@ export async function readGit($: EngineInterface, withCounts = false): Promise<G
       return count === undefined ? file : { ...file, added: count[0], removed: count[1] }
     }),
     ...(isFolded() ? { isFolded: true } : {}),
+    ...(pushing === undefined ? {} : { pushing }),
   }
 }
 

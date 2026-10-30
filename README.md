@@ -36,7 +36,12 @@ the whole project under it, and what each turn touched marked on it.
 - **The last ten turns** one click away: the turn's name opens the list of
   them, latest first, each with its state's dot, its files and its prompt, to
   pick one by what it was asked; `‹ ›` step through them one by one.
-- **Since the last commit**, as a second view, for the whole picture.
+- **Since the last commit**, as a second view, for the whole picture, with
+  the branch's commits not pushed yet, the latest by their message.
+- **Where you left off**: a session that begins on work left from before
+  (changes not committed, commits not pushed) opens on that view, so the next
+  morning shows where the day ended; the first turn brings the turn back, unless
+  you picked the view yourself.
 
 ## Working with it
 
@@ -76,9 +81,11 @@ Git is asked only while the pane is drawn somewhere. A run nothing draws in
 (`claude -p`, the SDK, a desktop session no window shows), a terminal too narrow
 for the pane, a pane closed: Canopy keeps the list of what Claude's file tools
 change, and asks git nothing until the pane is drawn again, when one scan
-catches up. The search's list of the project's files is made the first time you
-search, and again while you do, once files came or went: never for a pane
-nobody searches in. The files a turn changed are read a few at a time as it
+catches up. The pane's first drawing asks git once, to know whether work was
+left; the commit view asks too for the commits not pushed, by one `git log`
+only when git's own count says there are some. The search's list of the
+project's files is made the first time you search, and again while you do,
+once files came or went: never for a pane nobody searches in. The files a turn changed are read a few at a time as it
 ends, so the turn does not wait for them one by one.
 
 ## Safety
@@ -158,6 +165,10 @@ Any JetBrains IDE works through its launcher (`webstorm64.exe`, `pycharm`…).
   turn alone; earlier turns show what Claude's file tools changed.
 - Outside a repository the search walks the folder itself: 20,000 files and
   2,000 folders at most.
+- What is pushed is what git last heard from the remote, at your last push or
+  fetch: Canopy never goes to the network. A branch with no upstream counts the
+  commits on none of the remote branches; a repository with no remote says
+  nothing of pushing.
 - A file changed by a command is attributed by time: written while one of
   Claude's commands ran is Claude's, anything else is an *other change*. A
   command left running in the background counts as running until its turn

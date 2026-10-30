@@ -33,6 +33,10 @@ const en = {
   others: (n: number) => count(n, 'other change', 'other changes'),
   elsewhere: (n: number) => `${n} outside the project`,
   sinceCommit: 'since the last commit',
+  // The branch's commits no remote has, and none of them
+  unpushed: (n: number) => count(n, 'commit not pushed', 'commits not pushed'),
+  pushed: 'all pushed',
+  allPushed: (branch: string) => `${branch}: all committed and pushed.`,
 
   // Notices
   askingGit: 'Asking git…',
@@ -140,6 +144,9 @@ const it: Strings = {
   others: n => count(n, 'altra modifica', 'altre modifiche'),
   elsewhere: n => `${n} fuori dal progetto`,
   sinceCommit: 'dall’ultimo commit',
+  unpushed: n => count(n, 'commit non pushato', 'commit non pushati'),
+  pushed: 'tutto pushato',
+  allPushed: branch => `${branch}: tutto committato e pushato.`,
 
   askingGit: 'Interrogo git…',
   noRepo: 'Qui non c’è un repository git.',

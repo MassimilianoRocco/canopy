@@ -12,6 +12,7 @@ import { isPaneSeen, noteDrawn, owe } from './watch'
 const history = atom({ plugin: 'canopy', key: 'history' } as const, [])
 const git = atom({ plugin: 'canopy', key: 'git' } as const, null)
 const mode = atom({ plugin: 'canopy', key: 'mode' } as const, 'turn')
+const opening = atom({ plugin: 'canopy', key: 'opening' } as const, 'pending')
 const root = atom({ plugin: 'canopy', key: 'root' } as const, '')
 const catalog = atom({ plugin: 'canopy', key: 'catalog' } as const, null)
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
@@ -407,11 +408,14 @@ export const isScanning = () => scanTimer !== undefined || scanJob !== undefined
 
 export const hasScanned = () => hasAnswered
 
-/** The same files in the same states: a status that redraws nothing. */
+/** The same files in the same states, the same commits to push: a status that redraws nothing. */
 const isSameStatus = (a: GitStatus | null, b: GitStatus | null) =>
   a === null || b === null
     ? a === b
-    : a.top === b.top && a.isFolded === b.isFolded && JSON.stringify(a.files) === JSON.stringify(b.files)
+    : a.top === b.top &&
+      a.isFolded === b.isFolded &&
+      JSON.stringify(a.files) === JSON.stringify(b.files) &&
+      JSON.stringify(a.pushing) === JSON.stringify(b.pushing)
 
 /** Keeps `status` as git's last answer, unless it says what the one kept says. */
 async function keepStatus($: EngineInterface, status: GitStatus | null) {
@@ -434,17 +438,42 @@ const shapeOf = (status: GitStatus | null) =>
     : [status.top, ...status.files.filter(file => file.code !== 'M').map(file => `${file.code}${file.rel}`)].join('\0')
 
 /**
+ * The session's first answer from git chooses its view: with no turn yet and
+ * work left in the repository (changes not committed, commits not pushed), the
+ * commit view, which the first turn closes again (see `closeOpening`); else
+ * the turn, as ever. A view the person chose stays theirs.
+ */
+async function chooseOpening($: EngineInterface, status: GitStatus | null) {
+  if ((await read($, opening)) !== 'pending') return
+  const isLeft = status !== null && (status.files.length > 0 || (status.pushing?.count ?? 0) > 0)
+  const isFirst = (await read($, history)).length === 0 && (await read($, mode)) === 'turn'
+  await update($, opening, () => (isLeft && isFirst ? 'commit' : 'done'))
+  if (isLeft && isFirst) await update($, mode, () => 'commit')
+}
+
+/** A turn begins: the commit view Canopy opened by itself gives the pane back to the turn. */
+export async function closeOpening($: EngineInterface) {
+  if ((await read($, opening)) === 'commit' && (await read($, mode)) === 'commit') await update($, mode, () => 'turn')
+  await update($, opening, () => 'done')
+}
+
+/**
  * Asks git again and marks what it found. The counts since the last commit
- * only where they are drawn, and never on the prompt's path (`withCounts`
- * false): one git call fewer.
+ * only where they are drawn (and for the session's first view, which may be
+ * the commit view), never on the prompt's path (`withCounts` false): one git
+ * call fewer.
  */
 export async function runScan($: EngineInterface, withCounts?: boolean) {
   clearHeads()
   // The turn it marks, taken before git is asked: a new one may begin while it runs
   const turnId = (await read($, history)).at(-1)?.id
-  const status = await readGit($, withCounts ?? (await read($, mode)) === 'commit')
+  const status = await readGit(
+    $,
+    withCounts ?? ((await read($, mode)) === 'commit' || (await read($, opening)) === 'pending'),
+  )
   hasAnswered = true
   await keepStatus($, status)
+  await chooseOpening($, status)
   if (status !== null && turnId !== undefined) await markScanned($, status, turnId)
   const shape = shapeOf(status)
   if (lastShape !== undefined && lastShape !== shape) {
@@ -466,6 +495,14 @@ function startScan($: EngineInterface, withCounts?: boolean) {
   })
 
   return job
+}
+
+/** Asks git now, for a press that waits on it: a scan waiting on its timer is this one. */
+export function scanNow($: EngineInterface) {
+  scanTimer?.cancel()
+  scanTimer = undefined
+
+  return startScan($)
 }
 
 export function scheduleScan($: EngineInterface, ms = SCAN_DELAY) {

@@ -12,6 +12,7 @@ import { PANE, actOn, renderPane } from './pane'
 import { isRecord, keyOf, labelOf } from './paths'
 import {
   captureStart,
+  closeOpening,
   countLater,
   keepText,
   noteFilesChanged,
@@ -34,6 +35,7 @@ const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
 const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
 const turnsOpen = atom({ plugin: 'canopy', key: 'isTurnsOpen' } as const, false)
+const opening = atom({ plugin: 'canopy', key: 'opening' } as const, 'pending')
 const SNAPSHOT = { plugin: 'canopy', key: 'snapshot' } as const
 
 // What Canopy follows of a tool call: a file it edits or writes, or a command. What Claude
@@ -150,6 +152,8 @@ export const register: Register = (on, options) => {
       await update($, history, () => [])
       await update($, shown, () => null)
       await update($, opened, () => null)
+      // Its first drawing chooses its view again, on the work it finds left
+      await update($, opening, () => 'pending')
     }
     // The comparisons' copies, a few files at most: a secret kept no longer than the session
     await emptySides($)
@@ -187,6 +191,7 @@ export const register: Register = (on, options) => {
     await update($, shown, () => null)
     await update($, promptOpen, () => false)
     await update($, turnsOpen, () => false)
+    await closeOpening($)
     // What the files were as it began, kept off this path
     captureStart($, e.turnId)
 

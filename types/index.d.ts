@@ -77,12 +77,30 @@ export type GitFile = {
   removed?: number
 }
 
+/** A commit by its short hash and the first line of its message. */
+export type LocalCommit = { hash: string; subject: string }
+
+/**
+ * What the branch holds that no remote has: `count` commits, the latest few
+ * in `commits`, newest first. None of them: all pushed.
+ */
+export type Pushing = { branch: string; count: number; commits: LocalCommit[] }
+
 /**
  * The last `git status`, its paths relative to `top`, the repository's root.
  * `isFolded` once git lists a folder it doesn't know as one entry (`venv/`),
- * not file by file: there were too many such files.
+ * not file by file: there were too many such files. `pushing` where the commit
+ * view asked for it, on a branch of a repository with a remote.
  */
-export type GitStatus = { at: number; top: string; files: GitFile[]; isFolded?: boolean }
+export type GitStatus = { at: number; top: string; files: GitFile[]; isFolded?: boolean; pushing?: Pushing }
+
+/**
+ * How the session's first view was chosen: `pending` until git first answers;
+ * `commit` when Canopy opened the commit view itself, on work left from before
+ * (changes not committed, commits not pushed), which the first turn closes
+ * again; `done` once there is nothing left to choose.
+ */
+export type Opening = 'pending' | 'commit' | 'done'
 
 /**
  * What git ignores under the repository (`node_modules/`, `.env`), folders
@@ -107,6 +125,7 @@ declare module 'claude-code' {
       /** Per `<turnId>|<file key>`: the texts a turn's diff is drawn from. */
       snapshot: StateFamily<Snapshot>
       mode: Mode
+      opening: Opening
       /** How a changed file opens: its changes (the default) or whole, as last pressed. */
       diffView: DiffView
       /** Null before the first scan, or outside a repository. */

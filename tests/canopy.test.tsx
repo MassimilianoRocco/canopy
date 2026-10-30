@@ -4,8 +4,9 @@ import type { Mounted, TestBody } from 'claude-code/testing'
 
 import { changesOf, diffLines, linesOf } from '../hooks/diff'
 import { quoteArg } from '../hooks/editor'
+import { branchOf } from '../hooks/git'
 import { nativeOf, shownOf } from '../hooks/paths'
-import type { TurnRecord } from '../types'
+import type { LocalCommit, TurnRecord } from '../types'
 
 const PANE = {
   plugin: 'canopy',
@@ -36,7 +37,9 @@ const IT = { options: { language: 'it' } }
 // `renamed` maps a staged rename's new path to its old one; `nested` is a
 // folder inside the project holding a repository of its own; `showDelay`, how
 // long each `git show` takes on the test's clock, and `statusDelay` each
-// `git status` listing every file git doesn't know.
+// `git status` listing every file git doesn't know. `branch` is the line
+// `status --branch` puts first, without its `## `; `unpushed`, the commits no
+// remote has, newest first; `hasRemote`, whether the repository has one.
 type Repo = {
   head: Record<string, string>
   ignored?: string[]
@@ -44,6 +47,9 @@ type Repo = {
   nested?: string
   showDelay?: number
   statusDelay?: number
+  branch?: string
+  unpushed?: LocalCommit[]
+  hasRemote?: boolean
 }
 
 const ran = (exitCode: number, stdout = '') => ({
@@ -212,9 +218,19 @@ const project = (
       const gone = Object.keys(repo.head)
         .filter(rel => !disk.has(`C:\\proj\\${rel.replace(/\//g, '\\')}`) && !sources.has(rel))
         .map(rel => ` D ${rel}\0`)
+      const branch = rest.includes('--branch') && repo.branch !== undefined ? [`## ${repo.branch}\0`] : []
 
-      return ran(0, [...onDisk, ...moves, ...gone].join(''))
+      return ran(0, [...branch, ...onDisk, ...moves, ...gone].join(''))
     }
+    // The commits no remote has: against the upstream, or against every remote
+    const unpushed = repo.unpushed ?? []
+    if (verb === 'log') {
+      const most = Number(rest.find(arg => arg.startsWith('--max-count='))?.slice('--max-count='.length) ?? Infinity)
+
+      return ran(0, unpushed.slice(0, most).map(one => `${one.hash}\t${one.subject}\0`).join(''))
+    }
+    if (verb === 'rev-list') return ran(0, `${unpushed.length}\n`)
+    if (verb === 'for-each-ref') return ran(0, repo.hasRemote === true ? 'refs/remotes/origin/main\n' : '')
     // The lines added and removed since the commit, as `diff --numstat -z -M HEAD` gives them:
     // a rename's path empty, its old and new path after it; a file git doesn't track absent
     if (verb === 'diff') {
@@ -1963,6 +1979,166 @@ test('whole paths in their system’s separators: Windows’ backslashes, slashe
   expect(nativeOf('C:/Temp/notes.txt')).toBe('C:\\Temp\\notes.txt')
   expect(nativeOf('/tmp/notes.txt')).toBe('/tmp/notes.txt')
   expect(nativeOf('src/login.ts')).toBe('src/login.ts')
+})
+
+// ---- The work left from before ----
+
+const LEFT: LocalCommit[] = [
+  { hash: 'a1b2c3d', subject: 'aggiunge la tendina dei turni' },
+  { hash: 'b2c3d4e', subject: 'un tasto per tornare all’albero' },
+  { hash: 'c3d4e5f', subject: 'avvii più sicuri' },
+  { hash: 'd4e5f6a', subject: 'copia il percorso' },
+  { hash: 'e5f6a7b', subject: 'un pannello più leggero' },
+  { hash: 'f6a7b8c', subject: 'conteggi delle righe' },
+  { hash: 'a7b8c9d', subject: 'prima versione' },
+]
+
+const isPrimary = async (ui: Mounted<'terminal', 'Pane'>, key: string) => (await ui.find({ key }))?.props.variant === 'primary'
+
+test('a session begun on work left opens on it, the commits to push too; the first turn goes back to the turn', IT, async ($, on) => {
+  const repo: Repo = { head: { 'a.ts': 'x\n', 'b.ts': 'p\n' }, branch: 'main...origin/main [ahead 7]', unpushed: LEFT }
+  const { clock, argvs } = project(on, { 'C:\\proj\\a.ts': 'y\n', 'C:\\proj\\b.ts': 'p\n' }, repo)
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(await isPrimary(ui, 'mode:commit')).toBe(true)
+  // No word on turns there are none of: what is left, from the top
+  expect(await ui.find({ type: 'Text', text: /^Ancora nessun turno/ })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '1 file' })).toBeDefined()
+  expect(await ui.find({ key: 'chg:c:/proj/a.ts' })).toBeDefined()
+  // The branch, its commits to push by git's own count, the latest five by their message
+  expect(await ui.find({ type: 'Text', text: 'main ·' })).toBeDefined()
+  expect((await ui.find({ type: 'Text', text: '7 commit non pushati' }))?.props.color).toBe('warning')
+  expect(await ui.find({ type: 'Text', text: 'a1b2c3d' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'aggiunge la tendina dei turni' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'un pannello più leggero' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'conteggi delle righe' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: '… altri 2' })).toBeDefined()
+  // Listed against the upstream git named: no remote looked for
+  expect(argvs.some(argv => argv.includes('log') && argv.includes('@{upstream}..HEAD'))).toBe(true)
+  expect(argvs.some(argv => argv.includes('for-each-ref'))).toBe(false)
+
+  // The first turn takes the pane back: Canopy chose that view, not the person
+  await $.turn.start({ text: 'continua', turnId: 't1' })
+  expect(await isPrimary(ui, 'mode:turn')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: 'Turno 1' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '7 commit non pushati' })).toBeUndefined()
+  // The commit view, pressed, still has it
+  await ui.press({ key: 'mode:commit' })
+  expect(await ui.find({ type: 'Text', text: '7 commit non pushati' })).toBeDefined()
+  // Pushed meanwhile, the same files changed: the branch says so at the next scan
+  repo.branch = 'main...origin/main'
+  repo.unpushed = []
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Text', text: '7 commit non pushati' })).toBeUndefined()
+  expect(await ui.find({ type: 'Text', text: 'tutto pushato' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('the commit view picked by hand stays as the first turn begins', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'y\n' }, { head: { 'a.ts': 'x\n' }, branch: 'main' })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(await isPrimary(ui, 'mode:commit')).toBe(true)
+  await ui.press({ key: 'mode:commit' })
+  await $.turn.start({ text: 'continua', turnId: 't1' })
+  expect(await isPrimary(ui, 'mode:commit')).toBe(true)
+  await ui.unmount()
+})
+
+test('after a /clear the next conversation opens on the work left too', IT, async ($, on) => {
+  const { clock } = project(on, { 'C:\\proj\\a.ts': 'y\n' }, { head: { 'a.ts': 'x\n' }, branch: 'main' })
+  on('session.end', (_, e) => ({ sessionId: e.sessionId }))
+
+  const first = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  await $.turn.start({ text: 'continua', turnId: 't1' })
+  await $.turn.complete(done('t1'))
+  await clock.advance(300)
+  expect(await isPrimary(first, 'mode:turn')).toBe(true)
+  await first.unmount()
+
+  await $.session.end({ reason: 'clear', sessionId: 's1', resume: { id: 's1' } })
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(await isPrimary(ui, 'mode:commit')).toBe(true)
+  await ui.unmount()
+})
+
+test('nothing left: the pane stays on the turns, git asked once; the commit view says all is pushed', IT, async ($, on) => {
+  const { clock, argvs, touch } = project(
+    on,
+    { 'C:\\proj\\a.ts': 'x\n' },
+    { head: { 'a.ts': 'x\n' }, branch: 'main...origin/main' },
+  )
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  await clock.advance(1000)
+  expect(await isPrimary(ui, 'mode:turn')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: /^Ancora nessun turno/ })).toBeDefined()
+  expect(argvs.filter(argv => argv.includes('status'))).toHaveLength(1)
+  // Up to date with its upstream: no list to ask for
+  expect(argvs.some(argv => argv.includes('log'))).toBe(false)
+
+  await ui.press({ key: 'mode:commit' })
+  expect(await ui.find({ type: 'Text', text: 'main: tutto committato e pushato.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'main ·' })).toBeUndefined()
+  // A change since: the branch says its commits are pushed, beside it
+  touch('C:\\proj\\a.ts', 'y\n')
+  await ui.press({ key: 'refresh' })
+  expect(await ui.find({ type: 'Text', text: '1 file' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'main ·' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'tutto pushato' })).toBeDefined()
+  await ui.unmount()
+})
+
+test('a branch never pushed counts the commits on no remote, and opens on them', IT, async ($, on) => {
+  const { clock, argvs } = project(
+    on,
+    { 'C:\\proj\\a.ts': 'x\n' },
+    { head: { 'a.ts': 'x\n' }, branch: 'feature', unpushed: LEFT.slice(0, 1), hasRemote: true },
+  )
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  expect(await isPrimary(ui, 'mode:commit')).toBe(true)
+  expect(await ui.find({ type: 'Text', text: 'Nessuna modifica dall’ultimo commit.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'feature ·' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: '1 commit non pushato' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: 'a1b2c3d' })).toBeDefined()
+  expect(argvs.some(argv => argv.includes('rev-list') && argv.includes('--remotes'))).toBe(true)
+  await ui.unmount()
+})
+
+test('a repository with no remote says nothing of pushing, nor asks for commits', IT, async ($, on) => {
+  const { clock, argvs } = project(on, { 'C:\\proj\\a.ts': 'x\n' }, { head: { 'a.ts': 'x\n' }, branch: 'main', unpushed: LEFT })
+
+  const ui = await $.ui.mount({ ...PANE, surface: 'terminal' })
+  await clock.advance(1)
+  // Nothing to push to: nothing left either
+  expect(await isPrimary(ui, 'mode:turn')).toBe(true)
+  await ui.press({ key: 'mode:commit' })
+  expect(await ui.find({ type: 'Text', text: 'Nessuna modifica dall’ultimo commit.' })).toBeDefined()
+  expect(await ui.find({ type: 'Text', text: /pushat/ })).toBeUndefined()
+  expect(argvs.some(argv => argv.includes('log') || argv.includes('rev-list'))).toBe(false)
+  await ui.unmount()
+})
+
+test('the branch as git status names it first', () => {
+  expect(branchOf('## main')).toEqual({ name: 'main', upstream: null, ahead: 0 })
+  expect(branchOf('## main...origin/main')).toEqual({ name: 'main', upstream: 'origin/main', ahead: 0 })
+  expect(branchOf('## release/1.5...origin/release/1.5 [ahead 2, behind 1]')).toEqual({
+    name: 'release/1.5',
+    upstream: 'origin/release/1.5',
+    ahead: 2,
+  })
+  expect(branchOf('## main...origin/main [behind 3]')).toEqual({ name: 'main', upstream: 'origin/main', ahead: 0 })
+  // An upstream deleted since, a detached HEAD, a repository with no commit yet
+  expect(branchOf('## main...origin/main [gone]')).toEqual({ name: 'main', upstream: null, ahead: 0 })
+  expect(branchOf('## HEAD (no branch)')).toBeNull()
+  expect(branchOf('## No commits yet on main')).toBeNull()
 })
 
 // ---- Badges ----

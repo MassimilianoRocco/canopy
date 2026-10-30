@@ -10,7 +10,7 @@ import { renderLists } from './lists'
 import { TONE_OF_CODE, countsOf, statusColorOf, toneOf, turnStatusOf, wordOf } from './model'
 import type { Change } from './model'
 import { isUnder, keyOf, labelOf, pathIn } from './paths'
-import { hasScanned, isScanning, runScan, scheduleScan } from './scan'
+import { hasScanned, isScanning, scanNow, scheduleScan } from './scan'
 import { search } from './search'
 import { STRINGS } from './text'
 
@@ -28,6 +28,7 @@ const lang = atom({ plugin: 'canopy', key: 'lang' } as const, 'en')
 const editor = atom({ plugin: 'canopy', key: 'editor' } as const, null)
 const promptOpen = atom({ plugin: 'canopy', key: 'isPromptOpen' } as const, false)
 const turnsOpen = atom({ plugin: 'canopy', key: 'isTurnsOpen' } as const, false)
+const opening = atom({ plugin: 'canopy', key: 'opening' } as const, 'pending')
 
 const primaryIf = (isOn: boolean) => (isOn ? { variant: 'primary' as const } : {})
 
@@ -68,8 +69,10 @@ export async function renderPane(
   const ide = editorName === null ? undefined : currentEditor()
 
   // The commit view before any scan: git asked once, off this drawing. Once only:
-  // outside a repository its answer stays null, and asking on every null would loop
-  if (how === 'commit' && status === null && !hasScanned() && !isScanning()) scheduleScan($, 0)
+  // outside a repository its answer stays null, and asking on every null would loop.
+  // The session's first drawing with no turn asks too: work left from before opens on it
+  const isOpening = list.length === 0 && (await read($, opening)) === 'pending'
+  if (((how === 'commit' && status === null && !hasScanned()) || isOpening) && !isScanning()) scheduleScan($, 0)
 
   // ---- What the colours say: the turn's changes, or git's ----
   const baseKey = keyOf(base)
@@ -138,9 +141,14 @@ export async function renderPane(
   // what it was asked; the arrows step through them one by one
   const isTurnsOpen = list.length > 1 && (await read($, turnsOpen))
 
+  // The commit view needs no word on turns there are none of
   const header =
     turn === undefined ? (
-      <Text dimColor>{s.noTurn}</Text>
+      how === 'commit' ? (
+        <Box />
+      ) : (
+        <Text dimColor>{s.noTurn}</Text>
+      )
     ) : (
       <Box flexDirection="column">
         <Box flexDirection="row" justifyContent="space-between" gap={1}>
@@ -244,9 +252,11 @@ export async function renderPane(
   const text = await read($, query)
   const isSearching = text.trim() !== ''
   const choose = (next: Mode) => async () => {
+    // A view picked by hand is kept: the first turn no longer changes it
+    await update($, opening, () => 'done')
     if (next === how) return
     await update($, mode, () => next)
-    if (next === 'commit') await runScan($).catch(() => undefined)
+    if (next === 'commit') await scanNow($)
   }
   const controls = (
     <Box flexDirection="row" justifyContent="space-between" flexWrap="wrap" gap={1} marginTop={1}>
@@ -260,7 +270,7 @@ export async function renderPane(
       </Box>
       <Box flexDirection="row" gap={1}>
         {how === 'commit' && (
-          <Button key="refresh" onPress={() => runScan($).catch(() => undefined)}>
+          <Button key="refresh" onPress={() => scanNow($)}>
             {s.refresh}
           </Button>
         )}
@@ -305,14 +315,56 @@ export async function renderPane(
     elsewhere.length > 0 ? s.elsewhere(elsewhere.length) : '',
     how === 'commit' && changes.length > 0 ? s.sinceCommit : '',
   ].filter(one => one !== '')
+  // What the branch holds that no remote has, in the commit view of a repository with a remote
+  const pushing = how === 'commit' ? status?.pushing : undefined
+  const isAllPushed = pushing !== undefined && pushing.count === 0
   const notice =
     how === 'commit'
       ? status === null
         ? !hasScanned() || isScanning() ? s.askingGit : s.noRepo
-        : changes.length === 0 ? s.noChangesCommit : ''
+        : changes.length === 0 ? (isAllPushed ? s.allPushed(pushing.branch) : s.noChangesCommit) : ''
       : turn !== undefined && changes.length === 0 && others.length === 0 && elsewhere.length === 0
         ? s.nothingTouched
         : ''
+  // The branch under the summary: its commits to push, the latest by their message; all
+  // pushed, a word, unless the notice said it already
+  const branchRows = pushing !== undefined && !(isAllPushed && changes.length === 0) && (
+    <Box flexDirection="column">
+      <Box flexDirection="row" columnGap={1}>
+        <Text dimColor size="footnote">
+          {pushing.branch} ·
+        </Text>
+        {pushing.count > 0 ? (
+          <Text color="warning" size="footnote">
+            {s.unpushed(pushing.count)}
+          </Text>
+        ) : (
+          <Text dimColor size="footnote">
+            {s.pushed}
+          </Text>
+        )}
+      </Box>
+      {pushing.commits.map(commit => (
+        <Box key={`commit:${commit.hash}`} flexDirection="row" columnGap={1} marginLeft={2}>
+          <Text dimColor size="footnote" tabular>
+            {commit.hash}
+          </Text>
+          <Box flexShrink={1}>
+            <Text size="footnote" wrap="truncate-end">
+              {commit.subject}
+            </Text>
+          </Box>
+        </Box>
+      ))}
+      {pushing.count > pushing.commits.length && pushing.commits.length > 0 && (
+        <Box marginLeft={2}>
+          <Text dimColor size="footnote">
+            {s.more(pushing.count - pushing.commits.length)}
+          </Text>
+        </Box>
+      )}
+    </Box>
+  )
   const summary = (changes.length > 0 || extras.length > 0 || notice !== '') && (
     <Box flexDirection="row" flexWrap="wrap" columnGap={1} marginTop={1}>
       {changes.length > 0 && (
@@ -368,6 +420,7 @@ export async function renderPane(
     <Box flexDirection="column">
       {header}
       {summary}
+      {branchRows}
       {/* git lists the folders it doesn't know whole: a file a command made in one is not named */}
       {status?.isFolded === true && (
         <Text dimColor size="footnote">
