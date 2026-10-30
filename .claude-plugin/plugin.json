@@ -1,7 +1,7 @@
 {
   "name": "canopy",
   "version": "1.5.0",
-  "description": "A live project tree beside the conversation: the files Claude reads and changes, turn by turn, with each turn's diff",
+  "description": "A live project tree beside the conversation: the files Claude changes, turn by turn, with each turn's diff",
   "author": { "name": "Massimiliano Rocco" },
   "license": "MIT",
   "keywords": ["files", "diff", "tree", "turns", "intellij", "vscode"],

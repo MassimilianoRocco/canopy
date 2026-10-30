@@ -5,7 +5,7 @@ const count = (n: number, one: string, many: string) => `${n} ${n === 1 ? one : 
 
 const en = {
   title: 'Canopy',
-  command: 'Show the project tree with the files Claude reads and changes, turn by turn',
+  command: 'Show the project tree with the files Claude changes, turn by turn',
 
   // The turn
   noTurn: 'No turns yet: as Claude works, the files it touches light up here.',
@@ -122,7 +122,7 @@ export type Strings = typeof en
 
 const it: Strings = {
   title: 'Canopy',
-  command: 'Mostra l’albero del progetto con i file che Claude legge e modifica, turno per turno',
+  command: 'Mostra l’albero del progetto con i file che Claude modifica, turno per turno',
 
   noTurn: 'Ancora nessun turno: quando Claude lavora, i file che tocca si colorano qui.',
   turn: n => `Turno ${n}`,

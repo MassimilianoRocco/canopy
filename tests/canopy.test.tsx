@@ -1298,14 +1298,14 @@ const describeCanopy = {
 test('the command reads in English in the menu by default', async ($, on) => {
   on('command.describe', (_, e) => ({ description: e.description, isHidden: e.isHidden }))
   expect((await $.command.describe(describeCanopy)).description).toBe(
-    'Show the project tree with the files Claude reads and changes, turn by turn',
+    'Show the project tree with the files Claude changes, turn by turn',
   )
 })
 
 test('and in Italian when the pane speaks Italian', IT, async ($, on) => {
   on('command.describe', (_, e) => ({ description: e.description, isHidden: e.isHidden }))
   expect((await $.command.describe(describeCanopy)).description).toBe(
-    'Mostra l’albero del progetto con i file che Claude legge e modifica, turno per turno',
+    'Mostra l’albero del progetto con i file che Claude modifica, turno per turno',
   )
 })
 
